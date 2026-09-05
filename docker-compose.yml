@@ -1,0 +1,24 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: novaflow
+      POSTGRES_USER: novaflow
+      POSTGRES_PASSWORD: novaflow
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U novaflow"], interval: 5s, timeout: 5s, retries: 10}
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://novaflow:novaflow@db:5432/novaflow
+      SECRET_KEY: ${SECRET_KEY:-change-me-before-production}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+      DEMO_SEED: ${DEMO_SEED:-true}
+    ports: ["8000:8000"]
+    depends_on: {db: {condition: service_healthy}}
+  frontend:
+    build: {context: ./frontend, args: {VITE_API_URL: http://localhost:8000/api}}
+    ports: ["3000:80"]
+    depends_on: [backend]
+volumes:
+  postgres_data:
