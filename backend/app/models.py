@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from enum import Enum
-from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, Float, ForeignKey, JSON, String, Text, Table, Column, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Enum as SAEnum, Float, ForeignKey, JSON, String, Text, Table, Column, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
@@ -8,6 +8,8 @@ from .database import Base
 class Role(str, Enum):
     ADMIN = "Administrador"
     MANAGER = "Gerente"
+    SUPERVISOR = "Supervisor"
+    ANALYST = "Analista"
     ATTENDANT = "Atendente"
     OPERATOR = "Operacional"
     FINANCE = "Financeiro"
@@ -36,6 +38,7 @@ class DemoMixin:
 
 class User(Base, TimestampMixin, DemoMixin):
     __tablename__ = "users"
+    __table_args__ = (CheckConstraint("employee_id IS NULL OR profile_id IS NULL", name="ck_user_single_profile_source"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     email: Mapped[str] = mapped_column(String(180), unique=True, index=True)
@@ -45,9 +48,74 @@ class User(Base, TimestampMixin, DemoMixin):
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     failed_login_attempts: Mapped[int] = mapped_column(default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    permissions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Legacy role/permissions are retained for data compatibility, never for authorization.
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), unique=True, nullable=True)
+    profile_id: Mapped[int | None] = mapped_column(ForeignKey("profiles.id"), nullable=True)
+    scope: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True)
+    managed_department_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    allowed_modules: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    permission_exceptions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    access_migrated: Mapped[bool] = mapped_column(Boolean, default=False)
+    employee: Mapped["Employee | None"] = relationship(foreign_keys=[employee_id])
+    profile: Mapped["Profile | None"] = relationship(foreign_keys=[profile_id])
 
 
-class Customer(Base, TimestampMixin, DemoMixin):
+profile_permissions = Table(
+    "profile_permissions", Base.metadata,
+    Column("profile_id", ForeignKey("profiles.id", ondelete="CASCADE"), primary_key=True),
+    Column("permission_id", ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class Permission(Base):
+    __tablename__ = "permissions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(100), unique=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    module: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    category: Mapped[str] = mapped_column(String(80))
+
+
+class AccessMigration(Base):
+    __tablename__ = "access_migrations"
+    name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Profile(Base, TimestampMixin):
+    __tablename__ = "profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    slug: Mapped[str] = mapped_column(String(100), unique=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    default_scope: Mapped[str] = mapped_column(String(30), default="OWN")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    permissions: Mapped[list[Permission]] = relationship(secondary=profile_permissions, lazy="selectin")
+
+
+class JobPosition(Base, TimestampMixin):
+    __tablename__ = "job_positions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"))
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True)
+    default_scope: Mapped[str] = mapped_column(String(30), default="OWN")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    profile: Mapped[Profile] = relationship()
+    department: Mapped["Department | None"] = relationship()
+
+
+class ScopedMixin:
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True)
+    owner_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
+class Customer(Base, TimestampMixin, DemoMixin, ScopedMixin):
     __tablename__ = "customers"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(150), index=True)
@@ -72,6 +140,10 @@ class Employee(Base, TimestampMixin, DemoMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(150))
     job_title: Mapped[str] = mapped_column(String(100))
+    job_position_id: Mapped[int | None] = mapped_column(ForeignKey("job_positions.id"), nullable=True)
+    access_scope: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    managed_department_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    job_position: Mapped[JobPosition | None] = relationship()
     email: Mapped[str | None] = mapped_column(String(180), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True)
@@ -80,7 +152,7 @@ class Employee(Base, TimestampMixin, DemoMixin):
     department: Mapped[Department | None] = relationship()
 
 
-class Service(Base, TimestampMixin, DemoMixin):
+class Service(Base, TimestampMixin, DemoMixin, ScopedMixin):
     __tablename__ = "services"
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(30), unique=True)
@@ -188,7 +260,7 @@ class OrderTask(Base, TimestampMixin, DemoMixin):
     assignee: Mapped[Employee | None] = relationship()
 
 
-class Appointment(Base, TimestampMixin, DemoMixin):
+class Appointment(Base, TimestampMixin, DemoMixin, ScopedMixin):
     __tablename__ = "appointments"
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(180))
@@ -197,6 +269,9 @@ class Appointment(Base, TimestampMixin, DemoMixin):
     ends_at: Mapped[datetime] = mapped_column(DateTime)
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
     employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True)
+    service_id: Mapped[int | None] = mapped_column(ForeignKey("services.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="Agendado")
     kind: Mapped[str] = mapped_column(String(30), default="Compromisso")
 
 
@@ -252,13 +327,20 @@ class OrderAttachment(Base, DemoMixin):
     created_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.utcnow)
 
 
-class Plan(Base,TimestampMixin,DemoMixin):
+class Plan(Base,TimestampMixin,DemoMixin,ScopedMixin):
     __tablename__="plans"
     id: Mapped[int]=mapped_column(primary_key=True)
     name: Mapped[str]=mapped_column(String(150))
     amount: Mapped[float]=mapped_column(Float)
     periodicity: Mapped[str]=mapped_column(String(30))
     active: Mapped[bool]=mapped_column(Boolean,default=True)
+    description: Mapped[str | None]=mapped_column(Text,nullable=True)
+    starts_on: Mapped[date | None]=mapped_column(Date,nullable=True)
+    ends_on: Mapped[date | None]=mapped_column(Date,nullable=True)
+    auto_renew: Mapped[bool]=mapped_column(Boolean,default=False)
+    max_users: Mapped[int | None]=mapped_column(nullable=True)
+    included_services: Mapped[str | None]=mapped_column(Text,nullable=True)
+    status: Mapped[str]=mapped_column(String(30),default="Ativo")
 
 
 class Subscription(Base,TimestampMixin,DemoMixin):
@@ -270,3 +352,18 @@ class Subscription(Base,TimestampMixin,DemoMixin):
     ends_on: Mapped[date|None]=mapped_column(Date,nullable=True)
     auto_renew: Mapped[bool]=mapped_column(Boolean,default=False)
     status: Mapped[str]=mapped_column(String(30),default="Ativo")
+
+
+class ModuleRecord(Base, TimestampMixin, DemoMixin, ScopedMixin):
+    """Persistent records for optional vertical workflows.
+
+    The resource discriminator keeps the feature framework extensible without
+    renaming or duplicating the core customer/order/employee tables.
+    """
+    __tablename__ = "module_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    module: Mapped[str] = mapped_column(String(30), index=True)
+    resource: Mapped[str] = mapped_column(String(40), index=True)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="Ativo", index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

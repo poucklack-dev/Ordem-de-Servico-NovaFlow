@@ -1,3 +1,2 @@
-export type Page='dashboard'|'orders'|'customers'|'employees'|'services'|'agenda'|'finance'|'reports'|'notifications'|'audit'|'users'|'settings';
+export type Page='dashboard'|'orders'|'customers'|'employees'|'services'|'departments'|'agenda'|'agenda_appointments'|'my_agenda'|'finance'|'finance_receipts'|'receivables'|'payments'|'financial_reports'|'plans'|'contracts'|'subscriptions'|'renewals'|'students'|'enrollments'|'assessments'|'teachers'|'modalities'|'guardians'|'classes'|'courses'|'coordination'|'documents'|'reports'|'notifications'|'audit'|'users'|'settings'|'job_positions'|'profiles'|'permissions';
 export type User={id:number;name:string;email:string;role:string};
-

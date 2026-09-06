@@ -1,0 +1,3 @@
+body[data-financial="off"][data-page="orders"] .tabs button:last-child,body[data-financial="off"][data-page="orders"] label:has(input[name="value"]){display:none}
+.title-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.title-actions .table-action{padding:9px 12px}
+@media(max-width:700px){.title{align-items:flex-start;gap:12px}.title-actions{justify-content:flex-start}}
