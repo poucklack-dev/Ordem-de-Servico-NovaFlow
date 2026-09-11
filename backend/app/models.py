@@ -1,8 +1,12 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Enum as SAEnum, Float, ForeignKey, JSON, String, Text, Table, Column, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Enum as SAEnum, Float, ForeignKey, JSON, Numeric, String, Text, Table, Column, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Role(str, Enum):
@@ -28,8 +32,8 @@ class OrderStatus(str, Enum):
 
 
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class DemoMixin:
@@ -82,7 +86,7 @@ class Permission(Base):
 class AccessMigration(Base):
     __tablename__ = "access_migrations"
     name: Mapped[str] = mapped_column(String(100), primary_key=True)
-    applied_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class Profile(Base, TimestampMixin):
@@ -195,7 +199,7 @@ class OrderHistory(Base, DemoMixin):
     action: Mapped[str] = mapped_column(String(100))
     old_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class Payment(Base, TimestampMixin, DemoMixin):
@@ -208,6 +212,65 @@ class Payment(Base, TimestampMixin, DemoMixin):
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
 
+class FinancialReceipt(Base, TimestampMixin, DemoMixin, ScopedMixin):
+    __tablename__ = "financial_receipts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    charge_id: Mapped[int | None] = mapped_column(ForeignKey("module_records.id"), nullable=True, index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True)
+    customer_name: Mapped[str] = mapped_column(String(150))
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    received_on: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    method: Mapped[str] = mapped_column(String(30), default="PIX")
+    reference: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    origin: Mapped[str] = mapped_column(String(30), default="Manual")
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ChargeHistory(Base, TimestampMixin, DemoMixin):
+    __tablename__ = "charge_history"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    charge_id: Mapped[int] = mapped_column(ForeignKey("module_records.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(40), default="Contato")
+    channel: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    description: Mapped[str] = mapped_column(Text)
+    happened_on: Mapped[date] = mapped_column(Date, default=date.today)
+
+
+class FinancialPayable(Base, TimestampMixin, DemoMixin, ScopedMixin):
+    __tablename__ = "financial_payables"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    beneficiary: Mapped[str] = mapped_column(String(150), index=True)
+    category: Mapped[str] = mapped_column(String(80), default="Operacional", index=True)
+    description: Mapped[str] = mapped_column(String(240))
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+    competence: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="Pendente", index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
+class FinancialPayment(Base, TimestampMixin, DemoMixin, ScopedMixin):
+    __tablename__ = "financial_payments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payable_id: Mapped[int | None] = mapped_column(ForeignKey("financial_payables.id"), nullable=True, index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    beneficiary: Mapped[str] = mapped_column(String(150), index=True)
+    category: Mapped[str] = mapped_column(String(80), default="Operacional")
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    paid_on: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    method: Mapped[str] = mapped_column(String(30), default="PIX")
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -216,7 +279,7 @@ class AuditLog(Base):
     entity: Mapped[str] = mapped_column(String(80))
     entity_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class CompanySettings(Base):
@@ -312,7 +375,7 @@ class RefreshToken(Base):
     token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class OrderAttachment(Base, DemoMixin):
@@ -324,7 +387,7 @@ class OrderAttachment(Base, DemoMixin):
     stored_name: Mapped[str] = mapped_column(String(255),unique=True)
     content_type: Mapped[str] = mapped_column(String(100))
     size: Mapped[int]
-    created_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime,default=utc_now)
 
 
 class Plan(Base,TimestampMixin,DemoMixin,ScopedMixin):

@@ -1,4 +1,5 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pathlib import Path
@@ -6,14 +7,13 @@ import csv,io,secrets
 from sqlalchemy import func, select, false, or_
 from sqlalchemy.orm import Session
 from .database import get_db
-from .models import AuditLog, Appointment, ChecklistItem, CompanySettings, CustomField, Customer, Department, Employee, ModuleRecord, Notification, Order, OrderAttachment, OrderComment, OrderHistory, OrderStatus, OrderTask, Payment, Plan, RefreshToken, JobPosition, Profile, Role, Service, Subscription, User
-from .schemas import AppointmentIn, ChangePassword, ChecklistIn, CommentIn, CustomFieldIn, CustomerIn, CustomerOut, DemoDelete, EmployeeIn, Login, ModuleRecordIn, ModulesIn, OrderIn, PaymentIn, PlanIn, ServiceIn, SettingsIn, TaskIn, Token, UserIn
-from .security import admin_only, create_refresh_token, create_token, current_user, verify_password
+from .models import AuditLog, Appointment, ChargeHistory, ChecklistItem, CompanySettings, CustomField, Customer, Department, Employee, FinancialPayable, FinancialPayment, FinancialReceipt, ModuleRecord, Notification, Order, OrderAttachment, OrderComment, OrderHistory, OrderStatus, OrderTask, Payment, Plan, RefreshToken, JobPosition, Profile, Role, Service, Subscription, User, utc_now
+from .schemas import AppointmentIn, ChangePassword, ChargeContactIn, ChargeIn, ChecklistIn, CommentIn, CustomFieldIn, CustomerIn, CustomerOut, DemoDelete, EmployeeIn, Login, ModuleRecordIn, ModulesIn, OrderIn, OutgoingPaymentIn, PayableIn, PaymentIn, PlanIn, ReceiptIn, ServiceIn, SettingsIn, TaskIn, Token, UserIn
+from .security import admin_only, create_refresh_token, create_token, current_user, hash_password, verify_password
 from .access import authorization, serialize_user, has_permission, require_permission
 from .scopes import scope_clause, scoped_select, scoped_get, enforce_scope, scope_values, validate_order_values, validate_appointment_values
 from .modules import PERMISSIONS, configured_modules, permissions_for, require_module, validate_modules
 import hashlib
-from datetime import timedelta
 
 router = APIRouter(prefix="/api")
 
@@ -149,13 +149,178 @@ def next_billing_date(value: date, periodicity: str | None) -> date:
     return date(year,month,min(value.day,month_days[month-1]))
 
 
+def money_value(value) -> Decimal:
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"))
+
+
+def charge_amount(charge: ModuleRecord) -> Decimal:
+    return money_value((charge.data or {}).get("amount"))
+
+
+def charge_due_date(charge: ModuleRecord) -> date | None:
+    try: return date.fromisoformat(str((charge.data or {}).get("due_date")))
+    except (TypeError, ValueError): return None
+
+
+def charge_receipts(db: Session, user: User, charge_id: int):
+    return db.scalars(scoped_select(db, user, FinancialReceipt).where(FinancialReceipt.charge_id == charge_id, FinancialReceipt.canceled_at.is_(None))).all()
+
+
+def computed_charge_status(charge: ModuleRecord, received: Decimal, today: date | None = None) -> str:
+    if charge.status == "Cancelado": return "Cancelado"
+    amount = charge_amount(charge)
+    if received >= amount and amount > 0: return "Pago"
+    if received > 0: return "Parcial"
+    due = charge_due_date(charge)
+    if due and due < (today or date.today()): return "Atrasado"
+    return "Pendente"
+
+
+def charge_out(charge: ModuleRecord, db: Session, user: User, *, include_history: bool = False):
+    receipts = charge_receipts(db, user, charge.id)
+    received = sum((money_value(x.amount) for x in receipts), Decimal("0.00"))
+    amount = charge_amount(charge)
+    due = charge_due_date(charge)
+    data = dict(charge.data or {})
+    status = computed_charge_status(charge, received)
+    row = {"id": charge.id, "department_id": charge.department_id, "customer": data.get("customer"), "customer_id": data.get("customer_id"),
+           "description": data.get("description") or data.get("plan") or data.get("reference") or "Cobrança", "amount": float(amount),
+           "received": float(received), "balance": float(max(Decimal("0.00"), amount - received)), "due_date": due,
+           "status": status, "stored_status": charge.status, "origin": data.get("origin") or ("Assinatura" if data.get("subscription_id") else "Manual"),
+           "origin_id": data.get("origin_id") or data.get("subscription_id") or data.get("enrollment_id"), "reference": data.get("reference") or data.get("plan"),
+           "note": data.get("note"), "created_at": charge.created_at}
+    if include_history:
+        history = db.scalars(select(ChargeHistory).where(ChargeHistory.charge_id == charge.id).order_by(ChargeHistory.happened_on.desc(), ChargeHistory.created_at.desc())).all()
+        row["receipts"] = [receipt_out(x) for x in receipts]
+        row["history"] = [{"id": x.id, "event_type": x.event_type, "channel": x.channel, "description": x.description, "happened_on": x.happened_on, "created_at": x.created_at} for x in history]
+    return row
+
+
+def receipt_out(x: FinancialReceipt):
+    return {"id": x.id, "charge_id": x.charge_id, "order_id": x.order_id, "customer_id": x.customer_id, "customer": x.customer_name,
+            "amount": float(x.amount), "received_on": x.received_on, "method": x.method, "reference": x.reference,
+            "origin": x.origin, "note": x.note, "created_at": x.created_at}
+
+
+def financial_charges(db: Session, user: User):
+    rows = db.scalars(scoped_select(db, user, ModuleRecord).where(ModuleRecord.module == "financial", ModuleRecord.resource == "charges", ModuleRecord.deleted_at.is_(None)).order_by(ModuleRecord.created_at.desc())).all()
+    return [charge_out(x, db, user) for x in rows]
+
+
+def update_stored_charge_status(charge: ModuleRecord, status: str):
+    if charge.status != "Cancelado":
+        charge.status = status
+
+
+def create_receipt_record(payload: ReceiptIn, db: Session, user: User) -> FinancialReceipt:
+    charge = scoped_get(db, user, ModuleRecord, payload.charge_id, write=True) if payload.charge_id else None
+    if charge and (charge.module != "financial" or charge.resource != "charges" or charge.deleted_at):
+        raise HTTPException(404, "Cobrança não encontrada.")
+    order = scoped_get(db, user, Order, payload.order_id) if payload.order_id else None
+    data = dict(charge.data or {}) if charge else {}
+    customer = payload.customer or data.get("customer") or (order.customer.name if order else None)
+    if not customer: raise HTTPException(422, "Informe o cliente do recebimento.")
+    if charge and charge.status == "Cancelado": raise HTTPException(422, "Não é possível receber uma cobrança cancelada.")
+    if charge:
+        current = sum((money_value(x.amount) for x in charge_receipts(db, user, charge.id)), Decimal("0.00"))
+        balance = charge_amount(charge) - current
+        if money_value(payload.amount) > balance:
+            raise HTTPException(422, "O valor recebido excede o saldo da cobrança.")
+    boundary = scope_values(db, user, payload.department_id, existing=charge) if charge else scope_values(db, user, payload.department_id)
+    receipt = FinancialReceipt(charge_id=payload.charge_id, order_id=payload.order_id, customer_id=payload.customer_id or data.get("customer_id"),
+                               customer_name=customer, amount=payload.amount, received_on=payload.received_on, method=payload.method,
+                               reference=payload.reference or data.get("reference"), origin=data.get("origin") or ("Ordem" if order else "Manual"),
+                               note=payload.note, created_by_id=user.id, **boundary)
+    db.add(receipt);db.flush()
+    if charge:
+        status = computed_charge_status(charge, sum((money_value(x.amount) for x in charge_receipts(db, user, charge.id)), Decimal("0.00")))
+        update_stored_charge_status(charge, status)
+        db.add(ChargeHistory(charge_id=charge.id, user_id=user.id, event_type="Recebimento", channel=payload.method, description=f"Recebimento de R$ {money_value(payload.amount)} registrado.", happened_on=payload.received_on, is_demo=charge.is_demo))
+    db.add(AuditLog(user_id=user.id, action="RECEIPT", entity="financial_receipt", entity_id=str(receipt.id)))
+    return receipt
+
+
+def payable_payments(db: Session, user: User, payable_id: int):
+    return db.scalars(scoped_select(db, user, FinancialPayment).where(FinancialPayment.payable_id == payable_id, FinancialPayment.canceled_at.is_(None))).all()
+
+
+def computed_payable_status(payable: FinancialPayable, paid: Decimal, today_value: date | None = None) -> str:
+    if payable.status == "Cancelado" or payable.canceled_at: return "Cancelado"
+    amount = money_value(payable.amount)
+    if paid >= amount and amount > 0: return "Pago"
+    if paid > 0: return "Parcial"
+    if payable.due_date < (today_value or date.today()): return "Atrasado"
+    return "Pendente"
+
+
+def payable_out(payable: FinancialPayable, db: Session, user: User, *, include_payments: bool = False):
+    payments = payable_payments(db, user, payable.id)
+    paid = sum((money_value(x.amount) for x in payments), Decimal("0.00"))
+    amount = money_value(payable.amount)
+    row = {"id": payable.id, "department_id": payable.department_id, "beneficiary": payable.beneficiary, "category": payable.category,
+           "description": payable.description, "order_id": payable.order_id, "amount": float(amount), "paid": float(paid),
+           "balance": float(max(Decimal("0.00"), amount - paid)), "due_date": payable.due_date, "competence": payable.competence,
+           "status": computed_payable_status(payable, paid), "stored_status": payable.status, "note": payable.note, "created_at": payable.created_at}
+    if include_payments:
+        row["payments"] = [outgoing_payment_out(x) for x in payments]
+    return row
+
+
+def outgoing_payment_out(x: FinancialPayment):
+    return {"id": x.id, "payable_id": x.payable_id, "order_id": x.order_id, "beneficiary": x.beneficiary,
+            "category": x.category, "amount": float(x.amount), "paid_on": x.paid_on, "method": x.method,
+            "note": x.note, "created_at": x.created_at}
+
+
+def financial_payables(db: Session, user: User):
+    rows = db.scalars(scoped_select(db, user, FinancialPayable).order_by(FinancialPayable.created_at.desc())).all()
+    return [payable_out(x, db, user) for x in rows]
+
+
+def create_outgoing_payment_record(payload: OutgoingPaymentIn, db: Session, user: User) -> FinancialPayment:
+    payable = scoped_get(db, user, FinancialPayable, payload.payable_id, write=True) if payload.payable_id else None
+    if payable and computed_payable_status(payable, sum((money_value(x.amount) for x in payable_payments(db, user, payable.id)), Decimal("0.00"))) == "Cancelado":
+        raise HTTPException(422, "Não é possível pagar uma conta cancelada.")
+    if payable:
+        current = sum((money_value(x.amount) for x in payable_payments(db, user, payable.id)), Decimal("0.00"))
+        balance = money_value(payable.amount) - current
+        if money_value(payload.amount) > balance:
+            raise HTTPException(422, "O valor pago excede o saldo da conta.")
+    order = scoped_get(db, user, Order, payload.order_id) if payload.order_id else None
+    beneficiary = payload.beneficiary or (payable.beneficiary if payable else None)
+    if not beneficiary: raise HTTPException(422, "Informe o favorecido do pagamento.")
+    boundary = scope_values(db, user, payload.department_id, existing=payable) if payable else scope_values(db, user, payload.department_id)
+    payment = FinancialPayment(payable_id=payload.payable_id, order_id=payload.order_id or (payable.order_id if payable else None),
+                               beneficiary=beneficiary, category=payload.category or (payable.category if payable else "Operacional"),
+                               amount=payload.amount, paid_on=payload.paid_on, method=payload.method, note=payload.note,
+                               created_by_id=user.id, **boundary)
+    db.add(payment);db.flush()
+    if payable:
+        payable.status = computed_payable_status(payable, sum((money_value(x.amount) for x in payable_payments(db, user, payable.id)), Decimal("0.00")))
+    if order:
+        db.add(OrderHistory(order_id=order.id,user_id=user.id,action="CUSTO",new_value=f"Pagamento de R$ {money_value(payload.amount)} para {beneficiary}"))
+    db.add(AuditLog(user_id=user.id, action="PAYABLE_PAYMENT", entity="financial_payment", entity_id=str(payment.id)))
+    return payment
+
+
 @router.post("/auth/login", response_model=Token)
 def login(data: Login, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == data.email.lower()))
-    if not user or not user.is_active or not verify_password(data.password, user.password_hash):
+    now = utc_now()
+    if not user or not user.is_active:
+        raise HTTPException(401, "E-mail ou senha inválidos")
+    if user.locked_until and user.locked_until > now:
+        raise HTTPException(429, "Conta temporariamente bloqueada por excesso de tentativas. Tente novamente em alguns minutos.")
+    if not verify_password(data.password, user.password_hash):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+        if user.failed_login_attempts >= 5:
+            user.locked_until = now + timedelta(minutes=15)
+        db.commit()
         raise HTTPException(401, "E-mail ou senha inválidos")
     authorization(user, db)
-    user.last_login = datetime.utcnow();raw,digest=create_refresh_token();db.add(RefreshToken(user_id=user.id,token_hash=digest,expires_at=datetime.utcnow()+timedelta(days=30)));db.commit()
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.last_login = utc_now();raw,digest=create_refresh_token();db.add(RefreshToken(user_id=user.id,token_hash=digest,expires_at=utc_now()+timedelta(days=30)));db.commit()
     return Token(access_token=create_token(user),refresh_token=raw,user=serialize_user(user, db))
 
 
@@ -166,18 +331,18 @@ def me(user: User = Depends(current_user)):
 
 @router.post("/auth/refresh",response_model=Token)
 def refresh(refresh_token:str,db:Session=Depends(get_db)):
-    digest=hashlib.sha256(refresh_token.encode()).hexdigest();stored=db.scalar(select(RefreshToken).where(RefreshToken.token_hash==digest,RefreshToken.revoked_at.is_(None),RefreshToken.expires_at>datetime.utcnow()))
+    digest=hashlib.sha256(refresh_token.encode()).hexdigest();stored=db.scalar(select(RefreshToken).where(RefreshToken.token_hash==digest,RefreshToken.revoked_at.is_(None),RefreshToken.expires_at>utc_now()))
     if not stored:raise HTTPException(401,"Refresh token inválido")
     user=db.get(User,stored.user_id)
     if not user or not user.is_active: raise HTTPException(401,"Sessão inválida ou expirada")
     authorization(user, db)
-    stored.revoked_at=datetime.utcnow();raw,new_digest=create_refresh_token();db.add(RefreshToken(user_id=user.id,token_hash=new_digest,expires_at=datetime.utcnow()+timedelta(days=30)));db.commit();return Token(access_token=create_token(user),refresh_token=raw,user=serialize_user(user, db))
+    stored.revoked_at=utc_now();raw,new_digest=create_refresh_token();db.add(RefreshToken(user_id=user.id,token_hash=new_digest,expires_at=utc_now()+timedelta(days=30)));db.commit();return Token(access_token=create_token(user),refresh_token=raw,user=serialize_user(user, db))
 
 
 @router.post("/auth/change-password")
 def change_password(data:ChangePassword,db:Session=Depends(get_db),user:User=Depends(current_user)):
     if not verify_password(data.current_password,user.password_hash):raise HTTPException(400,"Senha atual incorreta")
-    user.password_hash=hash_password(data.new_password);db.query(RefreshToken).filter(RefreshToken.user_id==user.id,RefreshToken.revoked_at.is_(None)).update({"revoked_at":datetime.utcnow()});db.commit();return {"message":"Senha alterada"}
+    user.password_hash=hash_password(data.new_password);db.query(RefreshToken).filter(RefreshToken.user_id==user.id,RefreshToken.revoked_at.is_(None)).update({"revoked_at":utc_now()});db.commit();return {"message":"Senha alterada"}
 
 
 @router.post("/auth/forgot-password")
@@ -286,7 +451,7 @@ def update_customer(customer_id:int,data:CustomerIn,db:Session=Depends(get_db),u
 def delete_customer(customer_id:int,db:Session=Depends(get_db),user:User=Depends(require_permission("customers.delete"))):
     x=scoped_get(db,user,Customer,customer_id)
     if not x:raise HTTPException(404,"Cliente não encontrado")
-    x.deleted_at=datetime.utcnow();db.add(AuditLog(user_id=user.id,action="DELETE",entity="customer",entity_id=str(x.id)));db.commit();return {"message":"Cliente movido para a lixeira"}
+    x.deleted_at=utc_now();db.add(AuditLog(user_id=user.id,action="DELETE",entity="customer",entity_id=str(x.id)));db.commit();return {"message":"Cliente movido para a lixeira"}
 
 
 @router.get("/orders")
@@ -316,7 +481,13 @@ def order_detail(order_id: int, db: Session = Depends(get_db), user: User = Depe
     modules=configured_modules(db);show_financial=modules["financial"] and "financial.view" in permissions_for(user,modules)
     payments = db.scalars(scoped_select(db, user, Payment).where(Payment.order_id == x.id)).all() if show_financial else []
     attachments=db.scalars(select(OrderAttachment).where(OrderAttachment.order_id==x.id)).all()
-    return {"id":x.id,"number":x.number,"title":x.title,"description":x.description,"priority":x.priority,"status":x.status.value,"department_id":x.department_id,"due_date":x.due_date,"value":x.value if show_financial else None,"financial_enabled":show_financial,"customer":{"id":x.customer.id,"name":x.customer.name,"phone":x.customer.phone},"service":{"id":x.service.id,"name":x.service.name},"assignee":{"id":x.assignee.id,"name":x.assignee.name} if x.assignee else None,"comments":[{"id":c.id,"content":c.content,"internal":c.internal,"author":c.user.name,"created_at":c.created_at} for c in comments],"checklist":[{"id":i.id,"title":i.title,"completed":i.completed} for i in checklist],"tasks":[{"id":t.id,"title":t.title,"status":t.status,"priority":t.priority,"due_date":t.due_date,"assignee":t.assignee.name if t.assignee else None} for t in tasks],"history":[{"id":h.id,"action":h.action,"old_value":h.old_value,"new_value":h.new_value,"created_at":h.created_at} for h in history],"payments":[{"id":p.id,"amount":p.amount,"status":p.status,"method":p.method,"due_date":p.due_date} for p in payments],"attachments":[{"id":a.id,"name":a.original_name,"size":a.size,"url":f"/api/orders/{x.id}/attachments/{a.id}"} for a in attachments]}
+    order_charges=[row for row in financial_charges(db,user) if row.get("origin")=="Ordem" and str(row.get("origin_id") or row.get("reference") or "") in (str(x.id),x.number)] if show_financial else []
+    order_payables=[row for row in financial_payables(db,user) if row.get("order_id")==x.id] if show_financial else []
+    financial_summary={"charges":order_charges,"payables":order_payables,"revenue":sum(row["amount"] for row in order_charges) or (x.value or 0),"received":sum(row["received"] for row in order_charges)+sum(p.amount for p in payments if p.status=="Pago"),"costs":sum(row["amount"] for row in order_payables),"paid":sum(row["paid"] for row in order_payables)} if show_financial else None
+    if financial_summary:
+        financial_summary["result"]=financial_summary["received"]-financial_summary["paid"]
+        financial_summary["margin"]=round(financial_summary["result"]/financial_summary["received"]*100,1) if financial_summary["received"] else 0
+    return {"id":x.id,"number":x.number,"title":x.title,"description":x.description,"priority":x.priority,"status":x.status.value,"department_id":x.department_id,"due_date":x.due_date,"value":x.value if show_financial else None,"financial_enabled":show_financial,"financial":financial_summary,"customer":{"id":x.customer.id,"name":x.customer.name,"phone":x.customer.phone},"service":{"id":x.service.id,"name":x.service.name},"assignee":{"id":x.assignee.id,"name":x.assignee.name} if x.assignee else None,"comments":[{"id":c.id,"content":c.content,"internal":c.internal,"author":c.user.name,"created_at":c.created_at} for c in comments],"checklist":[{"id":i.id,"title":i.title,"completed":i.completed} for i in checklist],"tasks":[{"id":t.id,"title":t.title,"status":t.status,"priority":t.priority,"due_date":t.due_date,"assignee":t.assignee.name if t.assignee else None} for t in tasks],"history":[{"id":h.id,"action":h.action,"old_value":h.old_value,"new_value":h.new_value,"created_at":h.created_at} for h in history],"payments":[{"id":p.id,"amount":p.amount,"status":p.status,"method":p.method,"due_date":p.due_date} for p in payments],"attachments":[{"id":a.id,"name":a.original_name,"size":a.size,"url":f"/api/orders/{x.id}/attachments/{a.id}"} for a in attachments]}
 
 
 @router.post("/orders", status_code=201)
@@ -348,7 +519,7 @@ def update_order(order_id:int,data:OrderIn,db:Session=Depends(get_db),user:User=
 def delete_order(order_id:int,db:Session=Depends(get_db),user:User=Depends(require_permission("orders.delete"))):
     x=scoped_get(db,user,Order,order_id)
     if not x:raise HTTPException(404,"Ordem não encontrada")
-    x.deleted_at=datetime.utcnow();db.add(AuditLog(user_id=user.id,action="DELETE",entity="order",entity_id=str(x.id)));db.commit();return {"message":"Ordem movida para a lixeira"}
+    x.deleted_at=utc_now();db.add(AuditLog(user_id=user.id,action="DELETE",entity="order",entity_id=str(x.id)));db.commit();return {"message":"Ordem movida para a lixeira"}
 
 
 @router.patch("/orders/{order_id}/status")
@@ -356,7 +527,7 @@ def update_status(order_id: int, status: OrderStatus, db: Session = Depends(get_
     obj = scoped_get(db,user,Order, order_id)
     if not obj or obj.deleted_at: raise HTTPException(404, "Ordem não encontrada")
     old = obj.status.value; obj.status = status
-    if status == OrderStatus.DONE: obj.completed_at = datetime.utcnow()
+    if status == OrderStatus.DONE: obj.completed_at = utc_now()
     db.add(OrderHistory(order_id=obj.id, user_id=user.id, action="Status alterado", old_value=old, new_value=status.value))
     db.add(AuditLog(user_id=user.id, action="STATUS_CHANGE", entity="order", entity_id=str(obj.id), details={"from": old, "to": status.value})); db.commit()
     return {"message": "Status atualizado"}
@@ -458,6 +629,232 @@ def update_payment(payment_id:int,status:str,db:Session=Depends(get_db),user:Use
     x=scoped_get(db,user,Payment,payment_id)
     if not x:raise HTTPException(404,"Pagamento não encontrado")
     x.status=status;db.add(AuditLog(user_id=user.id,action="PAYMENT",entity="payment",entity_id=str(x.id),details={"status":status}));db.commit();return {"message":"Pagamento atualizado"}
+
+
+@router.get("/financial/charges")
+def list_charges(status:str|None=None,customer:str|None=None,origin:str|None=None,due_from:date|None=None,due_to:date|None=None,overdue:bool=False,upcoming:bool=False,q:str="",db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    rows = financial_charges(db, user)
+    if status: rows = [x for x in rows if x["status"] == status]
+    if customer: rows = [x for x in rows if customer.casefold() in str(x.get("customer") or "").casefold()]
+    if origin: rows = [x for x in rows if x["origin"] == origin]
+    if due_from: rows = [x for x in rows if x["due_date"] and x["due_date"] >= due_from]
+    if due_to: rows = [x for x in rows if x["due_date"] and x["due_date"] <= due_to]
+    if overdue: rows = [x for x in rows if x["status"] == "Atrasado" and x["balance"] > 0]
+    if upcoming: rows = [x for x in rows if x["due_date"] and x["due_date"] >= date.today() and x["balance"] > 0]
+    if q: rows = [x for x in rows if q.casefold() in " ".join(str(x.get(k) or "") for k in ("customer","description","reference","origin","origin_id")).casefold()]
+    return rows
+
+
+@router.post("/financial/charges",status_code=201)
+def create_charge(data:ChargeIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    payload=data.model_dump()
+    amount=payload.pop("amount")
+    department_id=payload.pop("department_id")
+    x=ModuleRecord(module="financial",resource="charges",data={**payload,"amount":float(amount),"due_date":payload["due_date"].isoformat()},status="Pendente",**scope_values(db,user,department_id))
+    db.add(x);db.flush()
+    db.add(ChargeHistory(charge_id=x.id,user_id=user.id,event_type="Criação",description="Cobrança criada.",happened_on=date.today()))
+    db.add(AuditLog(user_id=user.id,action="CREATE",entity="financial.charge",entity_id=str(x.id)));db.commit();db.refresh(x)
+    return charge_out(x,db,user,include_history=True)
+
+
+@router.get("/financial/charges/{charge_id}")
+def get_charge(charge_id:int,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.view"))):
+    x=scoped_get(db,user,ModuleRecord,charge_id)
+    if x.module!="financial" or x.resource!="charges": raise HTTPException(404,"Cobrança não encontrada")
+    return charge_out(x,db,user,include_history=True)
+
+
+@router.put("/financial/charges/{charge_id}")
+def update_charge(charge_id:int,data:ChargeIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.update"))):
+    x=scoped_get(db,user,ModuleRecord,charge_id,write=True)
+    if x.module!="financial" or x.resource!="charges" or x.status=="Cancelado": raise HTTPException(404,"Cobrança não encontrada")
+    if charge_receipts(db,user,x.id): raise HTTPException(422,"Cobranças com recebimento registrado não podem ter valor alterado.")
+    payload=data.model_dump();amount=payload.pop("amount");department_id=payload.pop("department_id")
+    boundary=scope_values(db,user,department_id,existing=x);x.department_id=boundary["department_id"];x.owner_user_id=boundary["owner_user_id"]
+    x.data={**payload,"amount":float(amount),"due_date":payload["due_date"].isoformat()}
+    update_stored_charge_status(x, computed_charge_status(x, Decimal("0.00")))
+    db.add(ChargeHistory(charge_id=x.id,user_id=user.id,event_type="Edição",description="Cobrança editada.",happened_on=date.today()))
+    db.add(AuditLog(user_id=user.id,action="UPDATE",entity="financial.charge",entity_id=str(x.id)));db.commit()
+    return charge_out(x,db,user,include_history=True)
+
+
+@router.post("/financial/charges/{charge_id}/cancel")
+def cancel_charge(charge_id:int,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.delete"))):
+    x=scoped_get(db,user,ModuleRecord,charge_id,write=True)
+    if x.module!="financial" or x.resource!="charges": raise HTTPException(404,"Cobrança não encontrada")
+    x.status="Cancelado";data=dict(x.data or {});data["canceled_at"]=utc_now().isoformat();x.data=data
+    db.add(ChargeHistory(charge_id=x.id,user_id=user.id,event_type="Cancelamento",description="Cobrança cancelada.",happened_on=date.today()))
+    db.add(AuditLog(user_id=user.id,action="CANCEL",entity="financial.charge",entity_id=str(x.id)));db.commit()
+    return {"message":"Cobrança cancelada"}
+
+
+@router.post("/financial/charges/{charge_id}/receipts",status_code=201)
+def receive_charge(charge_id:int,data:ReceiptIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    receipt = create_receipt_record(data.model_copy(update={"charge_id": charge_id}), db, user)
+    db.commit()
+    return receipt_out(receipt)
+
+
+@router.post("/financial/receipts",status_code=201)
+def create_receipt(data:ReceiptIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    receipt=create_receipt_record(data,db,user);db.commit();return receipt_out(receipt)
+
+
+@router.get("/financial/receipts")
+def list_receipts(method:str|None=None,origin:str|None=None,customer:str|None=None,received_from:date|None=None,received_to:date|None=None,q:str="",db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    rows=[receipt_out(x) for x in db.scalars(scoped_select(db,user,FinancialReceipt).where(FinancialReceipt.canceled_at.is_(None)).order_by(FinancialReceipt.received_on.desc(),FinancialReceipt.created_at.desc())).all()]
+    legacy=db.scalars(scoped_select(db,user,Payment).where(Payment.status=="Pago").order_by(Payment.created_at.desc())).all()
+    for x in legacy:
+        order=scoped_get(db,user,Order,x.order_id)
+        rows.append({"id":f"legacy-{x.id}","charge_id":None,"order_id":x.order_id,"customer_id":order.customer_id,"customer":order.customer.name,"amount":x.amount,"received_on":x.created_at.date(),"method":x.method,"reference":order.number,"origin":"Ordem","note":"Recebimento legado de ordem","created_at":x.created_at})
+    if method: rows=[x for x in rows if x["method"]==method]
+    if origin: rows=[x for x in rows if x["origin"]==origin]
+    if customer: rows=[x for x in rows if customer.casefold() in str(x["customer"]).casefold()]
+    if received_from: rows=[x for x in rows if date.fromisoformat(str(x["received_on"]))>=received_from]
+    if received_to: rows=[x for x in rows if date.fromisoformat(str(x["received_on"]))<=received_to]
+    if q: rows=[x for x in rows if q.casefold() in " ".join(str(x.get(k) or "") for k in ("customer","reference","origin","method")).casefold()]
+    return rows
+
+
+@router.get("/financial/payables")
+def list_payables(status:str|None=None,category:str|None=None,beneficiary:str|None=None,order_id:int|None=None,q:str="",db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    rows=financial_payables(db,user)
+    if status: rows=[x for x in rows if x["status"]==status]
+    if category: rows=[x for x in rows if x["category"]==category]
+    if beneficiary: rows=[x for x in rows if beneficiary.casefold() in x["beneficiary"].casefold()]
+    if order_id: rows=[x for x in rows if x["order_id"]==order_id]
+    if q: rows=[x for x in rows if q.casefold() in " ".join(str(x.get(k) or "") for k in ("beneficiary","category","description","order_id")).casefold()]
+    return rows
+
+
+@router.post("/financial/payables",status_code=201)
+def create_payable(data:PayableIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    values=data.model_dump();department_id=values.pop("department_id")
+    if values.get("order_id"): scoped_get(db,user,Order,values["order_id"])
+    x=FinancialPayable(**values,status="Pendente",created_by_id=user.id,**scope_values(db,user,department_id))
+    db.add(x);db.flush()
+    if x.order_id: db.add(OrderHistory(order_id=x.order_id,user_id=user.id,action="CUSTO",new_value=f"Conta a pagar de R$ {money_value(x.amount)} criada para {x.beneficiary}"))
+    db.add(AuditLog(user_id=user.id,action="CREATE",entity="financial.payable",entity_id=str(x.id),details={"amount":float(x.amount)}));db.commit();db.refresh(x)
+    return payable_out(x,db,user,include_payments=True)
+
+
+@router.get("/financial/payables/{payable_id}")
+def get_payable(payable_id:int,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.view"))):
+    return payable_out(scoped_get(db,user,FinancialPayable,payable_id),db,user,include_payments=True)
+
+
+@router.put("/financial/payables/{payable_id}")
+def update_payable(payable_id:int,data:PayableIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.update"))):
+    x=scoped_get(db,user,FinancialPayable,payable_id,write=True)
+    if payable_payments(db,user,x.id): raise HTTPException(422,"Contas com pagamento registrado não podem ter valor alterado.")
+    values=data.model_dump();department_id=values.pop("department_id")
+    if values.get("order_id"): scoped_get(db,user,Order,values["order_id"])
+    boundary=scope_values(db,user,department_id,existing=x)
+    for key,value in values.items(): setattr(x,key,value)
+    x.department_id=boundary["department_id"];x.owner_user_id=boundary["owner_user_id"];x.status=computed_payable_status(x,Decimal("0.00"))
+    db.add(AuditLog(user_id=user.id,action="UPDATE",entity="financial.payable",entity_id=str(x.id),details={"amount":float(x.amount)}));db.commit()
+    return payable_out(x,db,user,include_payments=True)
+
+
+@router.post("/financial/payables/{payable_id}/cancel")
+def cancel_payable(payable_id:int,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.delete"))):
+    x=scoped_get(db,user,FinancialPayable,payable_id,write=True)
+    x.status="Cancelado";x.canceled_at=utc_now()
+    db.add(AuditLog(user_id=user.id,action="CANCEL",entity="financial.payable",entity_id=str(x.id)));db.commit()
+    return {"message":"Conta a pagar cancelada"}
+
+
+@router.post("/financial/payables/{payable_id}/payments",status_code=201)
+def pay_payable(payable_id:int,data:OutgoingPaymentIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    payment=create_outgoing_payment_record(data.model_copy(update={"payable_id":payable_id}),db,user);db.commit();return outgoing_payment_out(payment)
+
+
+@router.post("/financial/payments",status_code=201)
+def create_outgoing_payment(data:OutgoingPaymentIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.create"))):
+    payment=create_outgoing_payment_record(data,db,user);db.commit();return outgoing_payment_out(payment)
+
+
+@router.get("/financial/payments")
+def list_outgoing_payments(method:str|None=None,category:str|None=None,beneficiary:str|None=None,order_id:int|None=None,q:str="",db:Session=Depends(get_db),user:User=Depends(require_module("financial","financial.view"))):
+    rows=[outgoing_payment_out(x) for x in db.scalars(scoped_select(db,user,FinancialPayment).where(FinancialPayment.canceled_at.is_(None)).order_by(FinancialPayment.paid_on.desc(),FinancialPayment.created_at.desc())).all()]
+    if method: rows=[x for x in rows if x["method"]==method]
+    if category: rows=[x for x in rows if x["category"]==category]
+    if beneficiary: rows=[x for x in rows if beneficiary.casefold() in x["beneficiary"].casefold()]
+    if order_id: rows=[x for x in rows if x["order_id"]==order_id]
+    if q: rows=[x for x in rows if q.casefold() in " ".join(str(x.get(k) or "") for k in ("beneficiary","category","order_id","method")).casefold()]
+    return rows
+
+
+@router.post("/financial/charges/{charge_id}/contacts",status_code=201)
+def register_charge_contact(charge_id:int,data:ChargeContactIn,db:Session=Depends(get_db),user:User=Depends(require_module("financial", "financial.update"))):
+    x=scoped_get(db,user,ModuleRecord,charge_id)
+    if x.module!="financial" or x.resource!="charges": raise HTTPException(404,"Cobrança não encontrada")
+    db.add(ChargeHistory(charge_id=x.id,user_id=user.id,event_type="Contato",channel=data.channel,description=data.description,happened_on=data.happened_on,is_demo=x.is_demo))
+    db.add(AuditLog(user_id=user.id,action="CONTACT",entity="financial.charge",entity_id=str(x.id)));db.commit();return {"message":"Contato registrado"}
+
+
+@router.get("/financial/overview")
+def financial_overview(db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    charges=financial_charges(db,user);receipts=list_receipts(db=db,user=user);payables=financial_payables(db,user);payments=list_outgoing_payments(db=db,user=user)
+    today=date.today();month_start=today.replace(day=1);last30=today-timedelta(days=30)
+    received_month=sum(x["amount"] for x in receipts if date.fromisoformat(str(x["received_on"]))>=month_start)
+    paid_month=sum(x["amount"] for x in payments if date.fromisoformat(str(x["paid_on"]))>=month_start)
+    received_today=sum(x["amount"] for x in receipts if date.fromisoformat(str(x["received_on"]))==today)
+    paid_today=sum(x["amount"] for x in payments if date.fromisoformat(str(x["paid_on"]))==today)
+    received_30=sum(x["amount"] for x in receipts if date.fromisoformat(str(x["received_on"]))>=last30)
+    open_rows=[x for x in charges if x["status"] not in ("Pago","Cancelado") and x["balance"]>0]
+    open_payables=[x for x in payables if x["status"] not in ("Pago","Cancelado") and x["balance"]>0]
+    overdue=[x for x in open_rows if x["status"]=="Atrasado"]
+    overdue_payables=[x for x in open_payables if x["status"]=="Atrasado"]
+    by_status={};by_origin={};by_month={}
+    for row in charges:
+        by_status[row["status"]]=by_status.get(row["status"],0)+1
+        by_origin[row["origin"]]=by_origin.get(row["origin"],0)+row["amount"]
+    for row in receipts:
+        key=date.fromisoformat(str(row["received_on"])).strftime("%m/%Y");by_month[key]=by_month.get(key,0)+row["amount"]
+    upcoming=sorted([x for x in open_rows if x["due_date"] and x["due_date"]>=today],key=lambda x:x["due_date"])[:6]
+    next_payables=sorted([x for x in open_payables if x["due_date"] and x["due_date"]>=today],key=lambda x:x["due_date"])[:6]
+    projected=received_month-paid_month+sum(x["balance"] for x in open_rows)-sum(x["balance"] for x in open_payables)
+    alerts=[]
+    due_today=sum(1 for x in open_rows if x["due_date"]==today);payables_today=sum(1 for x in open_payables if x["due_date"]==today)
+    if due_today: alerts.append(f"{due_today} conta(s) a receber vencem hoje")
+    if payables_today: alerts.append(f"{payables_today} conta(s) a pagar vencem hoje")
+    if overdue_payables: alerts.append(f"{len(overdue_payables)} conta(s) a pagar atrasadas")
+    if overdue: alerts.append(f"{len({x['customer'] for x in overdue})} cliente(s) inadimplentes")
+    return {"cards":{"received_month":received_month,"paid_month":paid_month,"month_result":received_month-paid_month,"open":sum(x["balance"] for x in open_rows),"payable_open":sum(x["balance"] for x in open_payables),"overdue":sum(x["balance"] for x in overdue),"payable_overdue":sum(x["balance"] for x in overdue_payables),"delinquent_customers":len({x["customer"] for x in overdue}),"received_today":received_today,"paid_today":paid_today,"received_30":received_30,"upcoming":len(upcoming),"projected_result":projected,"delinquency_rate":round(len(overdue)/len(charges)*100,1) if charges else 0},"months":[{"label":k,"value":v} for k,v in by_month.items()],"status":[{"label":k,"value":v} for k,v in by_status.items()],"origins":[{"label":k,"value":v} for k,v in by_origin.items()],"upcoming":upcoming,"next_payables":next_payables,"latest_receipts":receipts[:6],"latest_payments":payments[:6],"alerts":alerts}
+
+
+@router.get("/financial/delinquency")
+def financial_delinquency(bucket:str|None=None,db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    today=date.today();rows=[]
+    for row in financial_charges(db,user):
+        if row["status"]=="Cancelado" or row["balance"]<=0 or not row["due_date"] or row["due_date"]>=today: continue
+        days=(today-row["due_date"]).days
+        band="1-7 dias" if days<=7 else "8-15 dias" if days<=15 else "16-30 dias" if days<=30 else "31-60 dias" if days<=60 else "60+ dias"
+        detail=get_charge(row["id"],db,user);contacts=[x for x in detail.get("history",[]) if x["event_type"]=="Contato"]
+        row={**row,"days_overdue":days,"bucket":band,"last_contact":contacts[0]["happened_on"] if contacts else None}
+        rows.append(row)
+    if bucket: rows=[x for x in rows if x["bucket"]==bucket]
+    rows=sorted(rows,key=lambda x:(x["days_overdue"],x["balance"]),reverse=True)
+    return {"cards":{"overdue_value":sum(x["balance"] for x in rows),"customers":len({x["customer"] for x in rows}),"charges":len(rows),"average_days":round(sum(x["days_overdue"] for x in rows)/len(rows),1) if rows else 0},"buckets":[{"label":label,"value":sum(1 for x in rows if x["bucket"]==label)} for label in ["1-7 dias","8-15 dias","16-30 dias","31-60 dias","60+ dias"]],"rows":rows}
+
+
+@router.get("/financial/reports")
+def financial_reports(period_from:date|None=None,period_to:date|None=None,db:Session=Depends(get_db),user: User = Depends(require_module("financial", "financial.view"))):
+    charges=financial_charges(db,user);receipts=list_receipts(db=db,user=user);payables=financial_payables(db,user);payments=list_outgoing_payments(db=db,user=user)
+    if period_from: receipts=[x for x in receipts if date.fromisoformat(str(x["received_on"]))>=period_from]
+    if period_to: receipts=[x for x in receipts if date.fromisoformat(str(x["received_on"]))<=period_to]
+    if period_from: payments=[x for x in payments if date.fromisoformat(str(x["paid_on"]))>=period_from]
+    if period_to: payments=[x for x in payments if date.fromisoformat(str(x["paid_on"]))<=period_to]
+    month={};expense_month={};result_month={};origin={};method={};expense_category={};payment_method={}
+    for r in receipts:
+        month_key=date.fromisoformat(str(r["received_on"])).strftime("%m/%Y");month[month_key]=month.get(month_key,0)+r["amount"];origin[r["origin"]]=origin.get(r["origin"],0)+r["amount"];method[r["method"]]=method.get(r["method"],0)+r["amount"]
+    for p in payments:
+        key=date.fromisoformat(str(p["paid_on"])).strftime("%m/%Y");expense_month[key]=expense_month.get(key,0)+p["amount"];expense_category[p["category"]]=expense_category.get(p["category"],0)+p["amount"];payment_method[p["method"]]=payment_method.get(p["method"],0)+p["amount"]
+    for key in set(month)|set(expense_month): result_month[key]=month.get(key,0)-expense_month.get(key,0)
+    open_value=sum(x["balance"] for x in charges if x["status"] not in ("Pago","Cancelado"));overdue_value=sum(x["balance"] for x in charges if x["status"]=="Atrasado")
+    payable_open=sum(x["balance"] for x in payables if x["status"] not in ("Pago","Cancelado"));paid=sum(x["amount"] for x in payments);received=sum(x["amount"] for x in receipts)
+    return {"summary":{"received":received,"paid":paid,"result":received-paid,"margin":round((received-paid)/received*100,1) if received else 0,"open":open_value,"payable_open":payable_open,"overdue":overdue_value,"delinquency_rate":round(overdue_value/open_value*100,1) if open_value else 0,"average_ticket":round(received/len(receipts),2) if receipts else 0,"average_payment":round(paid/len(payments),2) if payments else 0,"receipts":len(receipts),"payments":len(payments),"charges":len(charges),"payables":len(payables)},"by_month":[{"label":k,"value":v} for k,v in month.items()],"expense_by_month":[{"label":k,"value":v} for k,v in expense_month.items()],"result_by_month":[{"label":k,"value":v} for k,v in result_month.items()],"by_origin":[{"label":k,"value":v} for k,v in origin.items()],"by_method":[{"label":k,"value":v} for k,v in method.items()],"expense_by_category":[{"label":k,"value":v} for k,v in expense_category.items()],"payment_by_method":[{"label":k,"value":v} for k,v in payment_method.items()],"rows":receipts,"payment_rows":payments}
 
 
 @router.get("/appointments")
@@ -615,14 +1012,19 @@ def export_orders(db:Session=Depends(get_db),user:User=Depends(require_permissio
 
 
 @router.get("/reports/financial.csv")
-def export_financial(db:Session=Depends(get_db),user:User=Depends(require_module("financial","financial.export"))):
+def export_financial(period_from:date|None=None,period_to:date|None=None,db:Session=Depends(get_db),user:User=Depends(require_module("financial","financial.export"))):
     if not has_permission(user,"financial.view",db): raise HTTPException(403,"É necessária permissão para consultar o financeiro antes de exportá-lo.")
-    output=io.StringIO();writer=csv.writer(output,delimiter=";");writer.writerow(["Origem","Referencia","Valor","Forma","Vencimento","Status"])
-    for payment in db.scalars(scoped_select(db, user, Payment).order_by(Payment.created_at.desc())).all():
-        order=scoped_get(db,user,Order,payment.order_id);writer.writerow(["Ordem",order.number if order else payment.order_id,payment.amount,payment.method,payment.due_date or "",payment.status])
-    charges=db.scalars(scoped_select(db, user, ModuleRecord).where(ModuleRecord.module=="financial",ModuleRecord.resource=="charges",ModuleRecord.deleted_at.is_(None)).order_by(ModuleRecord.created_at.desc())).all()
-    for charge in charges: writer.writerow(["Cobranca",charge.data.get("customer",""),charge.data.get("amount",0),charge.data.get("method",""),charge.data.get("due_date",""),charge.status])
-    db.add(AuditLog(user_id=user.id,action="EXPORT",entity="financial"));db.commit();return StreamingResponse(iter([output.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=financeiro.csv"})
+    def cell(value):
+        text = "" if value is None else str(value)
+        return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+    data=financial_reports(period_from,period_to,db,user)
+    output=io.StringIO();output.write("\ufeff");writer=csv.writer(output,delimiter=";")
+    writer.writerow(["Tipo","Data","Pessoa","Categoria/Origem","Forma","Referencia","Valor","Observacao"])
+    for row in data["rows"]:
+        writer.writerow(["Recebimento",row["received_on"],cell(row["customer"]),cell(row["origin"]),cell(row["method"]),cell(row.get("reference")),row["amount"],cell(row.get("note"))])
+    for row in data["payment_rows"]:
+        writer.writerow(["Pagamento",row["paid_on"],cell(row["beneficiary"]),cell(row["category"]),cell(row["method"]),cell(row.get("order_id")),row["amount"],cell(row.get("note"))])
+    db.add(AuditLog(user_id=user.id,action="EXPORT",entity="financial",details={"period_from":str(period_from) if period_from else None,"period_to":str(period_to) if period_to else None}));db.commit();return StreamingResponse(iter([output.getvalue()]),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=financeiro.csv"})
 
 
 @router.post("/orders/{order_id}/attachments",status_code=201)
@@ -762,7 +1164,7 @@ def update_module_record(module:str,resource:str,record_id:int,payload:ModuleRec
 def delete_module_record(module:str,resource:str,record_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     check_resource(module,resource,db,user,"delete");x=scoped_get(db,user,ModuleRecord,record_id)
     if not x or x.deleted_at or x.module!=module or x.resource!=resource: raise HTTPException(404,"Registro não encontrado")
-    x.deleted_at=datetime.utcnow();db.add(AuditLog(user_id=user.id,action="DELETE",entity=f"{module}.{resource}",entity_id=str(x.id)));db.commit();return {"message":"Registro removido"}
+    x.deleted_at=utc_now();db.add(AuditLog(user_id=user.id,action="DELETE",entity=f"{module}.{resource}",entity_id=str(x.id)));db.commit();return {"message":"Registro removido"}
 
 
 @router.get("/custom-fields")
@@ -777,7 +1179,7 @@ def create_custom_field(data:CustomFieldIn,db:Session=Depends(get_db),user:User=
 
 @router.get("/admin/demo-data")
 def demo_summary(db: Session = Depends(get_db), user: User = Depends(require_permission("system.manage"))):
-    models = [User, Customer, Department, Employee, Service, Order, OrderHistory, OrderComment, ChecklistItem, OrderTask, OrderAttachment, Appointment, Notification, Payment, Plan, Subscription, ModuleRecord]
+    models = [User, Customer, Department, Employee, Service, Order, OrderHistory, OrderComment, ChecklistItem, OrderTask, OrderAttachment, Appointment, Notification, Payment, FinancialReceipt, FinancialPayable, FinancialPayment, ChargeHistory, Plan, Subscription, ModuleRecord]
     counts = {m.__tablename__: db.scalar(select(func.count(m.id)).where(m.is_demo.is_(True))) or 0 for m in models}
     return {"has_demo_data": any(counts.values()), "counts": counts, "total": sum(counts.values())}
 
@@ -789,19 +1191,19 @@ def delete_demo_data(data: DemoDelete, db: Session = Depends(get_db), user: User
     # Preserve qualquer cadastro demo que tenha se tornado dependência de um
     # registro real. Isso evita quebrar chaves estrangeiras e nunca apaga dados reais.
     ids = lambda statement: {value for value in db.scalars(statement).all() if value is not None}
-    protected_customers = ids(select(Order.customer_id).where(Order.is_demo.is_(False))) | ids(select(Appointment.customer_id).where(Appointment.is_demo.is_(False))) | ids(select(Subscription.customer_id).where(Subscription.is_demo.is_(False)))
+    protected_customers = ids(select(Order.customer_id).where(Order.is_demo.is_(False))) | ids(select(Appointment.customer_id).where(Appointment.is_demo.is_(False))) | ids(select(Subscription.customer_id).where(Subscription.is_demo.is_(False))) | ids(select(FinancialReceipt.customer_id).where(FinancialReceipt.is_demo.is_(False)))
     protected_services = ids(select(Order.service_id).where(Order.is_demo.is_(False))) | ids(select(Appointment.service_id).where(Appointment.is_demo.is_(False)))
     protected_employees = ids(select(User.employee_id).where(or_(User.is_demo.is_(False), User.id == user.id))) | ids(select(Order.assignee_id).where(Order.is_demo.is_(False))) | ids(select(OrderTask.assignee_id).where(OrderTask.is_demo.is_(False))) | ids(select(Appointment.employee_id).where(Appointment.is_demo.is_(False)))
     protected_plans = ids(select(Subscription.plan_id).where(Subscription.is_demo.is_(False)))
     protected_departments = ids(select(JobPosition.department_id)) | ids(select(User.department_id).where(or_(User.is_demo.is_(False), User.id == user.id))) | ids(select(Employee.department_id).where(Employee.id.in_(protected_employees)))
     protected_departments |= ids(select(Customer.department_id).where(Customer.id.in_(protected_customers))) | ids(select(Service.department_id).where(Service.id.in_(protected_services))) | ids(select(Plan.department_id).where(Plan.id.in_(protected_plans)))
-    for model in (Customer, Service, Plan, ModuleRecord, Appointment):
+    for model in (Customer, Service, Plan, ModuleRecord, Appointment, FinancialReceipt, FinancialPayable, FinancialPayment):
         protected_departments |= ids(select(model.department_id).where(model.is_demo.is_(False)))
     protected_departments |= ids(select(Order.department_id).where(Order.is_demo.is_(False)))
 
     protected_users = {user.id}
     protected_users |= ids(select(Customer.owner_user_id).where(Customer.id.in_(protected_customers))) | ids(select(Service.owner_user_id).where(Service.id.in_(protected_services))) | ids(select(Plan.owner_user_id).where(Plan.id.in_(protected_plans)))
-    for model in (Customer, Service, Plan, ModuleRecord, Appointment):
+    for model in (Customer, Service, Plan, ModuleRecord, Appointment, FinancialReceipt, FinancialPayable, FinancialPayment):
         protected_users |= ids(select(model.owner_user_id).where(model.is_demo.is_(False)))
     protected_users |= ids(select(OrderComment.user_id).where(OrderComment.is_demo.is_(False)))
     protected_users |= ids(select(OrderAttachment.user_id).where(OrderAttachment.is_demo.is_(False)))
@@ -809,7 +1211,7 @@ def delete_demo_data(data: DemoDelete, db: Session = Depends(get_db), user: User
     # Dependentes primeiro; tudo acontece em uma única transação.
     counts = {}
     protected_by_model = {Employee: protected_employees, Service: protected_services, Customer: protected_customers, Department: protected_departments, Plan: protected_plans}
-    for model in [Payment, OrderAttachment, OrderComment, ChecklistItem, OrderTask, Appointment, Notification, OrderHistory, ModuleRecord, Subscription, Order]:
+    for model in [FinancialPayment, FinancialReceipt, FinancialPayable, ChargeHistory, Payment, OrderAttachment, OrderComment, ChecklistItem, OrderTask, Appointment, Notification, OrderHistory, ModuleRecord, Subscription, Order]:
         items = db.scalars(select(model).where(model.is_demo.is_(True))).all()
         counts[model.__tablename__] = len(items)
         for item in items: db.delete(item)

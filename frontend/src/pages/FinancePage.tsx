@@ -1,111 +1,113 @@
-import {useEffect, useState} from 'react';
-import {api} from '../api';
-import {CheckCircle2, Plus, RefreshCw, Trash2} from 'lucide-react';
-import {Empty, Modal, Notice, Title, money} from '../components/UI';
+import {useEffect,useState} from 'react';
+import {api,download} from '../api';
+import {AlertTriangle,CheckCircle2,Clock,Download,Eye,MessageSquare,Plus,RefreshCw,Search,Trash2,WalletCards} from 'lucide-react';
+import {Empty,Loading,Modal,Notice,Title,money} from '../components/UI';
 import {useModules} from '../modules';
 
-type OpenForm = 'payment' | 'charge' | null;
+type Mode='overview'|'receipts'|'charges'|'delinquency'|'payables'|'payments'|'reports';
+const methods=['PIX','Dinheiro','Cartão de crédito','Cartão de débito','Boleto','Transferência','Outro'];
+const statusList=['Pendente','Parcial','Pago','Atrasado','Cancelado'];
+const fmt=(v:any)=>v?new Date(`${v}T00:00:00`).toLocaleDateString('pt-BR'):'-';
+const today=()=>new Date().toISOString().slice(0,10);
+function Metric({label,value,Icon,color='violet'}:{label:string;value:any;Icon:any;color?:string}){return <article className="metric"><span className={'icon '+color}><Icon/></span><div><small>{label}</small><strong>{value}</strong></div></article>}
+function Bars({title,rows,moneyValues=false}:{title:string;rows:any[];moneyValues?:boolean}){const max=Math.max(...rows.map(x=>Number(x.value)),1);return <article className="panel report"><h3>{title}</h3>{rows.map(x=><div key={x.label}><span>{x.label}</span><b>{moneyValues?money(Number(x.value)):x.value}</b><i style={{width:`${Number(x.value)/max*100}%`}}/></div>)}{!rows.length&&<Empty text="Sem dados para exibir"/>}</article>}
+function Filters({children,onClear}:{children:React.ReactNode;onClear:()=>void}){return <div className="filters"><span><Search size={16}/>Filtros</span>{children}<button className="filter-clear" onClick={onClear}>Limpar</button></div>}
+function Status({value}:{value:string}){const cls=value==='Pago'?'success':value==='Atrasado'?'danger':value==='Cancelado'?'muted':'';return <span className={`status ${cls}`}>{value}</span>}
+function useData<T>(path:string,deps:any[]=[]){const[data,setData]=useState<T>(),[error,setError]=useState('');const load=()=>api<T>(path).then(x=>{setData(x);setError('')}).catch(e=>setError(e.message));useEffect(()=>{void load()},deps);return{data,error,load}}
 
-export default function FinancePage() {
-  const [payments, setPayments] = useState<any[]>([]);
-  const [charges, setCharges] = useState<any[]>([]);
-  const [orders, setOrders] = useState<any[]>([]);
-  const [meta, setMeta] = useState<any>();
-  const [open, setOpen] = useState<OpenForm>(null);
-  const [message, setMessage] = useState('');
-  const {modules, allowed} = useModules();
-  const canCreate = allowed('financial.create');
-  const canUpdate = allowed('financial.update');
-  const canDelete = allowed('financial.delete');
+export default function FinancePage({mode='overview'}:{mode?:Mode}) {
+  const titles={overview:['Financeiro','Fluxo de caixa, receitas, despesas e alertas'],receipts:['Recebimentos','Dinheiro efetivamente recebido'],charges:['Contas a receber','Valores que a empresa tem direito a receber'],delinquency:['Inadimplência','Contas a receber vencidas com saldo aberto'],payables:['Contas a pagar','Valores que a empresa precisa pagar'],payments:['Pagamentos','Dinheiro que saiu da empresa'],reports:['Relatórios financeiros','Análise dos dados financeiros']};
+  return <>{mode==='overview'&&<Overview title={titles.overview}/>} {mode==='receipts'&&<Receipts title={titles.receipts}/>} {mode==='charges'&&<Charges title={titles.charges}/>} {mode==='delinquency'&&<Delinquency title={titles.delinquency}/>} {mode==='payables'&&<Payables title={titles.payables}/>} {mode==='payments'&&<OutgoingPayments title={titles.payments}/>} {mode==='reports'&&<Reports title={titles.reports}/>}</>;
+}
 
-  const load = () => Promise.all([
-    api<any[]>('/payments'),
-    api<any[]>('/module-data/financial/charges'),
-  ]).then(([paymentRows, chargeRows]) => {
-    setPayments(paymentRows);
-    setCharges(chargeRows);
-  });
+function Overview({title}:{title:string[]}) {
+  const {data,error}=useData<any>('/financial/overview',[]);
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]}/><Notice message={error} error/><div className="cards">
+    <Metric label="Recebido no mês" value={money(data.cards.received_month)} Icon={WalletCards} color="green"/>
+    <Metric label="Pago no mês" value={money(data.cards.paid_month)} Icon={WalletCards} color="red"/>
+    <Metric label="Resultado do mês" value={money(data.cards.month_result)} Icon={CheckCircle2} color={data.cards.month_result>=0?'green':'red'}/>
+    <Metric label="Resultado projetado" value={money(data.cards.projected_result)} Icon={Clock}/>
+    <Metric label="A receber" value={money(data.cards.open)} Icon={Clock}/>
+    <Metric label="A pagar" value={money(data.cards.payable_open)} Icon={Clock}/>
+    <Metric label="Vencido a receber" value={money(data.cards.overdue)} Icon={AlertTriangle} color="red"/>
+    <Metric label="Vencido a pagar" value={money(data.cards.payable_overdue)} Icon={AlertTriangle} color="red"/>
+  </div><div className="dashboard-grid">
+    <Bars title="Recebimentos por mês" rows={data.months} moneyValues/><Bars title="Distribuição por status" rows={data.status}/><Bars title="Receita por origem" rows={data.origins} moneyValues/>
+    <article className="panel"><h3>Alertas financeiros</h3>{data.alerts.map((x:string)=><p className="widget-row" key={x}><span>{x}</span></p>)}{!data.alerts.length&&<Empty text="Nenhum alerta financeiro"/>}</article>
+    <article className="panel"><h3>Próximos vencimentos</h3>{data.upcoming.map((x:any)=><p className="widget-row" key={x.id}><span>{x.customer}<small>{x.description} · {fmt(x.due_date)}</small></span><b>{money(x.balance)}</b></p>)}{!data.upcoming.length&&<Empty text="Sem cobranças próximas"/>}</article>
+    <article className="panel"><h3>Próximos pagamentos</h3>{data.next_payables.map((x:any)=><p className="widget-row" key={x.id}><span>{x.beneficiary}<small>{x.description} · {fmt(x.due_date)}</small></span><b>{money(x.balance)}</b></p>)}{!data.next_payables.length&&<Empty text="Sem pagamentos próximos"/>}</article>
+    <article className="panel"><h3>Últimos recebimentos</h3>{data.latest_receipts.map((x:any)=><p className="widget-row" key={x.id}><span>{x.customer}<small>{x.method} · {fmt(x.received_on)}</small></span><b>{money(x.amount)}</b></p>)}{!data.latest_receipts.length&&<Empty text="Sem recebimentos registrados"/>}</article>
+    <article className="panel"><h3>Últimos pagamentos</h3>{data.latest_payments.map((x:any)=><p className="widget-row" key={x.id}><span>{x.beneficiary}<small>{x.method} · {fmt(x.paid_on)}</small></span><b>{money(x.amount)}</b></p>)}{!data.latest_payments.length&&<Empty text="Sem pagamentos registrados"/>}</article>
+  </div></>
+}
 
-  useEffect(() => {
-    void load();
-    api<any[]>('/orders').then(setOrders);
-    api('/meta').then(setMeta);
-  }, []);
+function Receipts({title}:{title:string[]}) {
+  const [filters,setFilters]=useState({q:'',method:'',origin:''}),[open,setOpen]=useState(false),[message,setMessage]=useState('');
+  const query=new URLSearchParams(Object.entries(filters).filter(([,v])=>v)).toString();
+  const {data,error,load}=useData<any[]>(`/financial/receipts?${query}`,[query]);
+  const rows=data||[], {allowed}=useModules(), canCreate=allowed('financial.create');
+  const total=rows.reduce((s,x)=>s+Number(x.amount),0), month=rows.filter(x=>String(x.received_on).startsWith(today().slice(0,7))).reduce((s,x)=>s+Number(x.amount),0);
+  async function save(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);await api('/financial/receipts',{method:'POST',body:JSON.stringify(body)});setOpen(false);setMessage('Recebimento registrado.');load()}
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]} action={canCreate?<button className="primary" onClick={()=>setOpen(true)}><Plus size={17}/>Novo recebimento</button>:undefined}/><Notice message={message}/><Notice message={error} error/>
+    <div className="cards"><Metric label="Recebido hoje" value={money(rows.filter(x=>x.received_on===today()).reduce((s,x)=>s+Number(x.amount),0))} Icon={CheckCircle2} color="green"/><Metric label="Recebido no mês" value={money(month)} Icon={WalletCards}/><Metric label="Quantidade" value={rows.length} Icon={WalletCards}/><Metric label="Ticket médio" value={money(rows.length?total/rows.length:0)} Icon={WalletCards}/></div>
+    <Filters onClear={()=>setFilters({q:'',method:'',origin:''})}><input placeholder="Pesquisar" value={filters.q} onChange={e=>setFilters({...filters,q:e.target.value})}/><select value={filters.method} onChange={e=>setFilters({...filters,method:e.target.value})}><option value="">Forma</option>{methods.map(x=><option key={x}>{x}</option>)}</select><select value={filters.origin} onChange={e=>setFilters({...filters,origin:e.target.value})}><option value="">Origem</option>{['Manual','Ordem','Assinatura','Contrato','Matrícula'].map(x=><option key={x}>{x}</option>)}</select></Filters>
+    <div className="panel table-panel"><table><thead><tr><th>Data</th><th>Cliente</th><th>Referência</th><th>Origem</th><th>Forma</th><th>Valor</th><th>Situação</th></tr></thead><tbody>{rows.map(x=><tr key={x.id}><td>{fmt(x.received_on)}</td><td><b>{x.customer}</b></td><td>{x.reference||'-'}</td><td>{x.origin}</td><td>{x.method}</td><td>{money(x.amount)}</td><td><Status value="Recebido"/></td></tr>)}</tbody></table>{!rows.length&&<Empty text="Nenhum recebimento encontrado"/>}</div>
+    {open&&<Modal title="Novo recebimento" onClose={()=>setOpen(false)}><form className="form" onSubmit={save}><label>Cliente<input name="customer" required/></label><label>Valor<input name="amount" type="number" min="0.01" step=".01" required/></label><div className="form-row"><label>Data<input name="received_on" type="date" defaultValue={today()} required/></label><label>Forma<select name="method">{methods.map(x=><option key={x}>{x}</option>)}</select></label></div><label>Referência<input name="reference"/></label><label>Observação<textarea name="note"/></label><button className="primary">Salvar</button></form></Modal>}
+  </>
+}
 
-  async function save(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const values: any = Object.fromEntries(new FormData(e.currentTarget));
-    if (open === 'payment') {
-      await api('/payments', {method: 'POST', body: JSON.stringify({
-        ...values,
-        order_id: Number(values.order_id),
-        amount: Number(values.amount),
-        due_date: values.due_date || null,
-      })});
-    } else {
-      const {status, ...data} = values;
-      data.amount = Number(data.amount);
-      await api('/module-data/financial/charges', {method: 'POST', body: JSON.stringify({data, status})});
-    }
-    setOpen(null);
-    setMessage('Lançamento criado com sucesso.');
-    await load();
-  }
+function Charges({title}:{title:string[]}) {
+  const [filters,setFilters]=useState({q:'',status:''}),[open,setOpen]=useState<any>(),[receive,setReceive]=useState<any>(),[message,setMessage]=useState('');
+  const query=new URLSearchParams(Object.entries(filters).filter(([,v])=>v)).toString(),{data,error,load}=useData<any[]>(`/financial/charges?${query}`,[query]);
+  const {modules,allowed}=useModules(), canCreate=allowed('financial.create'), canUpdate=allowed('financial.update'), canDelete=allowed('financial.delete');
+  const rows=data||[], openRows=rows.filter(x=>!['Pago','Cancelado'].includes(x.status));
+  async function saveCharge(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);await api(`/financial/charges${open?.id?`/${open.id}`:''}`,{method:open?.id?'PUT':'POST',body:JSON.stringify(body)});setOpen(null);setMessage('Cobrança salva.');load()}
+  async function saveReceipt(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);body.customer=receive.customer;await api(`/financial/charges/${receive.id}/receipts`,{method:'POST',body:JSON.stringify(body)});setReceive(null);setMessage('Recebimento registrado.');load()}
+  async function cancel(row:any){if(!confirm('Cancelar esta cobrança?'))return;await api(`/financial/charges/${row.id}/cancel`,{method:'POST'});setMessage('Cobrança cancelada.');load()}
+  async function gen(){const r=await api<any>('/billing/generate',{method:'POST'});setMessage(r.message);load()}
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]} action={<div className="title-actions">{canCreate&&<button className="primary" onClick={()=>setOpen({})}><Plus size={17}/>Nova cobrança</button>}{canCreate&&modules.plans&&<button className="table-action" onClick={gen}><RefreshCw size={17}/>Gerar recorrências</button>}</div>}/><Notice message={message}/><Notice message={error} error/>
+    <div className="cards"><Metric label="Total em aberto" value={money(openRows.reduce((s,x)=>s+x.balance,0))} Icon={Clock}/><Metric label="Vence hoje" value={openRows.filter(x=>x.due_date===today()).length} Icon={Clock}/><Metric label="Próximos 7 dias" value={openRows.filter(x=>{const d=new Date(`${x.due_date}T00:00:00`),n=new Date();return d>=n&&d<=new Date(n.getTime()+7*86400000)}).length} Icon={WalletCards}/><Metric label="Vencidas" value={rows.filter(x=>x.status==='Atrasado').length} Icon={AlertTriangle} color="red"/></div>
+    <Filters onClear={()=>setFilters({q:'',status:''})}><input placeholder="Cliente, código, OS, contrato" value={filters.q} onChange={e=>setFilters({...filters,q:e.target.value})}/><select value={filters.status} onChange={e=>setFilters({...filters,status:e.target.value})}><option value="">Status</option>{statusList.map(x=><option key={x}>{x}</option>)}</select></Filters>
+    <div className="panel table-panel"><table><thead><tr><th>Cliente</th><th>Referência</th><th>Origem</th><th>Descrição</th><th>Valor</th><th>Recebido</th><th>Saldo</th><th>Vencimento</th><th>Status</th><th/></tr></thead><tbody>{rows.map(x=><tr key={x.id}><td><b>{x.customer}</b></td><td>{x.reference||'-'}</td><td>{x.origin}</td><td>{x.description}</td><td>{money(x.amount)}</td><td>{money(x.received)}</td><td>{money(x.balance)}</td><td>{fmt(x.due_date)}</td><td><Status value={x.status}/></td><td>{canUpdate&&x.balance>0&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>setReceive(x)}><CheckCircle2 size={15}/>Registrar recebimento</button>}{canUpdate&&x.received===0&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>setOpen(x)}><Eye size={15}/>Editar</button>}{canDelete&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>cancel(x)}><Trash2 size={15}/></button>}</td></tr>)}</tbody></table>{!rows.length&&<Empty text="Nenhuma conta a receber encontrada"/>}</div>
+    {open&&<Modal title={open.id?'Editar cobrança':'Nova cobrança'} onClose={()=>setOpen(null)}><form className="form" onSubmit={saveCharge}><label>Cliente<input name="customer" defaultValue={open.customer} required/></label><label>Descrição<input name="description" defaultValue={open.description} required/></label><div className="form-row"><label>Valor<input name="amount" type="number" min="0.01" step=".01" defaultValue={open.amount} required/></label><label>Vencimento<input name="due_date" type="date" defaultValue={open.due_date||today()} required/></label></div><label>Origem<select name="origin" defaultValue={open.origin||'Manual'}>{['Manual','Ordem','Contrato','Assinatura','Matrícula'].map(x=><option key={x}>{x}</option>)}</select></label><label>Referência<input name="reference" defaultValue={open.reference}/></label><label>Observação<textarea name="note" defaultValue={open.note}/></label><button className="primary">Salvar</button></form></Modal>}
+    {receive&&<Modal title="Registrar recebimento" onClose={()=>setReceive(null)}><form className="form" onSubmit={saveReceipt}><p>{money(receive.amount)} original · {money(receive.received)} recebido · {money(receive.balance)} em aberto</p><label>Valor recebido<input name="amount" type="number" min="0.01" max={receive.balance} step=".01" defaultValue={receive.balance} required/></label><div className="form-row"><label>Data<input name="received_on" type="date" defaultValue={today()} required/></label><label>Forma<select name="method">{methods.map(x=><option key={x}>{x}</option>)}</select></label></div><label>Observação<textarea name="note"/></label><button className="primary">Confirmar</button></form></Modal>}
+  </>
+}
 
-  async function generateRecurring() {
-    const result = await api<{message: string}>('/billing/generate', {method: 'POST'});
-    setMessage(result.message);
-    await load();
-  }
+function Delinquency({title}:{title:string[]}) {
+  const [bucket,setBucket]=useState(''),[contact,setContact]=useState<any>(),[message,setMessage]=useState(''),query=bucket?`?bucket=${encodeURIComponent(bucket)}`:'';
+  const {data,error,load}=useData<any>(`/financial/delinquency${query}`,[query]);const {allowed}=useModules();
+  async function save(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body=Object.fromEntries(f);await api(`/financial/charges/${contact.id}/contacts`,{method:'POST',body:JSON.stringify(body)});setContact(null);setMessage('Contato registrado.');load()}
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]}/><Notice message={message}/><Notice message={error} error/><div className="cards"><Metric label="Valor inadimplente" value={money(data.cards.overdue_value)} Icon={AlertTriangle} color="red"/><Metric label="Clientes inadimplentes" value={data.cards.customers} Icon={AlertTriangle}/><Metric label="Cobranças vencidas" value={data.cards.charges} Icon={Clock}/><Metric label="Média de atraso" value={`${data.cards.average_days} dias`} Icon={Clock}/></div><Filters onClear={()=>setBucket('')}><select value={bucket} onChange={e=>setBucket(e.target.value)}><option value="">Faixa de atraso</option>{data.buckets.map((x:any)=><option key={x.label}>{x.label}</option>)}</select></Filters><div className="dashboard-grid"><Bars title="Faixas de atraso" rows={data.buckets}/></div><div className="panel table-panel"><table><thead><tr><th>Cliente</th><th>Cobrança</th><th>Origem</th><th>Valor</th><th>Saldo</th><th>Vencimento</th><th>Dias</th><th>Faixa</th><th>Último contato</th><th/></tr></thead><tbody>{data.rows.map((x:any)=><tr key={x.id}><td><b>{x.customer}</b></td><td>{x.description}</td><td>{x.origin}</td><td>{money(x.amount)}</td><td>{money(x.balance)}</td><td>{fmt(x.due_date)}</td><td>{x.days_overdue}</td><td>{x.bucket}</td><td>{fmt(x.last_contact)}</td><td>{allowed('financial.update')&&<button className="table-action" onClick={()=>setContact(x)}><MessageSquare size={15}/>Contato</button>}</td></tr>)}</tbody></table>{!data.rows.length&&<Empty text="Sem inadimplência no filtro atual"/>}</div>{contact&&<Modal title="Registrar contato" onClose={()=>setContact(null)}><form className="form" onSubmit={save}><label>Data<input name="happened_on" type="date" defaultValue={today()} required/></label><label>Canal<select name="channel">{['WhatsApp','Telefone','E-mail','Outro'].map(x=><option key={x}>{x}</option>)}</select></label><label>Observação<textarea name="description" required/></label><button className="primary">Salvar</button></form></Modal>}</>
+}
 
-  async function markPaid(row: any) {
-    if (row.recordKind === 'payment') await api(`/payments/${row.id}?status=Pago`, {method: 'PATCH'});
-    else await api(`/module-data/financial/charges/${row.id}`, {method: 'PUT', body: JSON.stringify({data: row.source.data, status: 'Pago'})});
-    setMessage('Lançamento marcado como pago.');
-    await load();
-  }
+function Payables({title}:{title:string[]}) {
+  const [filters,setFilters]=useState({q:'',status:'',category:''}),[open,setOpen]=useState<any>(),[pay,setPay]=useState<any>(),[message,setMessage]=useState('');
+  const query=new URLSearchParams(Object.entries(filters).filter(([,v])=>v)).toString(),{data,error,load}=useData<any[]>(`/financial/payables?${query}`,[query]);
+  const {allowed}=useModules(),rows=data||[],canCreate=allowed('financial.create'),canUpdate=allowed('financial.update'),canDelete=allowed('financial.delete'),openRows=rows.filter(x=>!['Pago','Cancelado'].includes(x.status));
+  async function save(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);body.order_id=body.order_id?Number(body.order_id):null;await api(`/financial/payables${open?.id?`/${open.id}`:''}`,{method:open?.id?'PUT':'POST',body:JSON.stringify(body)});setOpen(null);setMessage('Conta a pagar salva.');load()}
+  async function savePayment(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);body.beneficiary=pay.beneficiary;body.category=pay.category;await api(`/financial/payables/${pay.id}/payments`,{method:'POST',body:JSON.stringify(body)});setPay(null);setMessage('Pagamento registrado.');load()}
+  async function cancel(row:any){if(!confirm('Cancelar esta conta a pagar?'))return;await api(`/financial/payables/${row.id}/cancel`,{method:'POST'});setMessage('Conta cancelada.');load()}
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]} action={canCreate?<button className="primary" onClick={()=>setOpen({})}><Plus size={17}/>Nova conta a pagar</button>:undefined}/><Notice message={message}/><Notice message={error} error/><div className="cards"><Metric label="Total a pagar" value={money(openRows.reduce((s,x)=>s+x.balance,0))} Icon={Clock}/><Metric label="Vence hoje" value={openRows.filter(x=>x.due_date===today()).length} Icon={Clock}/><Metric label="Próximos 7 dias" value={openRows.filter(x=>{const d=new Date(`${x.due_date}T00:00:00`),n=new Date();return d>=n&&d<=new Date(n.getTime()+7*86400000)}).length} Icon={WalletCards}/><Metric label="Valor vencido" value={money(rows.filter(x=>x.status==='Atrasado').reduce((s,x)=>s+x.balance,0))} Icon={AlertTriangle} color="red"/></div><Filters onClear={()=>setFilters({q:'',status:'',category:''})}><input placeholder="Pesquisar" value={filters.q} onChange={e=>setFilters({...filters,q:e.target.value})}/><select value={filters.status} onChange={e=>setFilters({...filters,status:e.target.value})}><option value="">Status</option>{statusList.map(x=><option key={x}>{x}</option>)}</select><input placeholder="Categoria" value={filters.category} onChange={e=>setFilters({...filters,category:e.target.value})}/></Filters><div className="panel table-panel"><table><thead><tr><th>Favorecido</th><th>Descrição</th><th>Categoria</th><th>OS</th><th>Valor</th><th>Pago</th><th>Saldo</th><th>Vencimento</th><th>Status</th><th/></tr></thead><tbody>{rows.map(x=><tr key={x.id}><td><b>{x.beneficiary}</b></td><td>{x.description}</td><td>{x.category}</td><td>{x.order_id||'-'}</td><td>{money(x.amount)}</td><td>{money(x.paid)}</td><td>{money(x.balance)}</td><td>{fmt(x.due_date)}</td><td><Status value={x.status}/></td><td>{canUpdate&&x.balance>0&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>setPay(x)}><CheckCircle2 size={15}/>Registrar pagamento</button>}{canUpdate&&x.paid===0&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>setOpen(x)}><Eye size={15}/>Editar</button>}{canDelete&&x.status!=='Cancelado'&&<button className="table-action" onClick={()=>cancel(x)}><Trash2 size={15}/></button>}</td></tr>)}</tbody></table>{!rows.length&&<Empty text="Nenhuma conta a pagar encontrada"/>}</div>{open&&<Modal title={open.id?'Editar conta a pagar':'Nova conta a pagar'} onClose={()=>setOpen(null)}><form className="form" onSubmit={save}><label>Favorecido / fornecedor<input name="beneficiary" defaultValue={open.beneficiary} required/></label><label>Descrição<input name="description" defaultValue={open.description} required/></label><div className="form-row"><label>Categoria<input name="category" defaultValue={open.category||'Operacional'} required/></label><label>Valor<input name="amount" type="number" min="0.01" step=".01" defaultValue={open.amount} required/></label></div><div className="form-row"><label>Vencimento<input name="due_date" type="date" defaultValue={open.due_date||today()} required/></label><label>Competência<input name="competence" type="date" defaultValue={open.competence||''}/></label></div><label>OS relacionada<input name="order_id" type="number" defaultValue={open.order_id||''}/></label><label>Observação<textarea name="note" defaultValue={open.note}/></label><button className="primary">Salvar</button></form></Modal>}{pay&&<Modal title="Registrar pagamento" onClose={()=>setPay(null)}><form className="form" onSubmit={savePayment}><p>{money(pay.amount)} original · {money(pay.paid)} pago · {money(pay.balance)} em aberto</p><label>Valor pago<input name="amount" type="number" min="0.01" max={pay.balance} step=".01" defaultValue={pay.balance} required/></label><div className="form-row"><label>Data<input name="paid_on" type="date" defaultValue={today()} required/></label><label>Forma<select name="method">{methods.map(x=><option key={x}>{x}</option>)}</select></label></div><label>Observação<textarea name="note"/></label><button className="primary">Confirmar</button></form></Modal>}</>
+}
 
-  async function removeCharge(row: any) {
-    if (!window.confirm('Deseja remover esta cobrança?')) return;
-    await api(`/module-data/financial/charges/${row.id}`, {method: 'DELETE'});
-    setMessage('Cobrança removida.');
-    await load();
-  }
+function OutgoingPayments({title}:{title:string[]}) {
+  const [filters,setFilters]=useState({q:'',method:'',category:''}),[open,setOpen]=useState(false),[message,setMessage]=useState('');
+  const query=new URLSearchParams(Object.entries(filters).filter(([,v])=>v)).toString(),{data,error,load}=useData<any[]>(`/financial/payments?${query}`,[query]);
+  const rows=data||[],{allowed}=useModules(),canCreate=allowed('financial.create'),total=rows.reduce((s,x)=>s+Number(x.amount),0),month=rows.filter(x=>String(x.paid_on).startsWith(today().slice(0,7))).reduce((s,x)=>s+Number(x.amount),0);
+  async function save(e:any){e.preventDefault();const f=new FormData(e.currentTarget),body:any=Object.fromEntries(f);body.amount=Number(body.amount);body.order_id=body.order_id?Number(body.order_id):null;await api('/financial/payments',{method:'POST',body:JSON.stringify(body)});setOpen(false);setMessage('Pagamento registrado.');load()}
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]} action={canCreate?<button className="primary" onClick={()=>setOpen(true)}><Plus size={17}/>Novo pagamento</button>:undefined}/><Notice message={message}/><Notice message={error} error/><div className="cards"><Metric label="Pago hoje" value={money(rows.filter(x=>x.paid_on===today()).reduce((s,x)=>s+Number(x.amount),0))} Icon={CheckCircle2} color="red"/><Metric label="Pago no mês" value={money(month)} Icon={WalletCards}/><Metric label="Quantidade" value={rows.length} Icon={WalletCards}/><Metric label="Ticket médio" value={money(rows.length?total/rows.length:0)} Icon={WalletCards}/></div><Filters onClear={()=>setFilters({q:'',method:'',category:''})}><input placeholder="Pesquisar" value={filters.q} onChange={e=>setFilters({...filters,q:e.target.value})}/><select value={filters.method} onChange={e=>setFilters({...filters,method:e.target.value})}><option value="">Forma</option>{methods.map(x=><option key={x}>{x}</option>)}</select><input placeholder="Categoria" value={filters.category} onChange={e=>setFilters({...filters,category:e.target.value})}/></Filters><div className="panel table-panel"><table><thead><tr><th>Data</th><th>Favorecido</th><th>Conta</th><th>Categoria</th><th>OS</th><th>Forma</th><th>Valor</th></tr></thead><tbody>{rows.map(x=><tr key={x.id}><td>{fmt(x.paid_on)}</td><td><b>{x.beneficiary}</b></td><td>{x.payable_id||'Manual'}</td><td>{x.category}</td><td>{x.order_id||'-'}</td><td>{x.method}</td><td>{money(x.amount)}</td></tr>)}</tbody></table>{!rows.length&&<Empty text="Nenhum pagamento encontrado"/>}</div>{open&&<Modal title="Novo pagamento" onClose={()=>setOpen(false)}><form className="form" onSubmit={save}><label>Favorecido<input name="beneficiary" required/></label><div className="form-row"><label>Categoria<input name="category" defaultValue="Operacional" required/></label><label>Valor<input name="amount" type="number" min="0.01" step=".01" required/></label></div><div className="form-row"><label>Data<input name="paid_on" type="date" defaultValue={today()} required/></label><label>Forma<select name="method">{methods.map(x=><option key={x}>{x}</option>)}</select></label></div><label>OS relacionada<input name="order_id" type="number"/></label><label>Observação<textarea name="note"/></label><button className="primary">Salvar</button></form></Modal>}</>
+}
 
-  const rows = [
-    ...payments.map(x => ({...x, key: `payment-${x.id}`, recordKind: 'payment', origin: 'Ordem', reference: x.order})),
-    ...charges.map(x => ({...x.data, id: x.id, key: `charge-${x.id}`, recordKind: 'charge', source: x, origin: 'Cobrança', reference: x.data.customer, status: x.status, method: x.data.method || '—'})),
-  ];
-  const received = rows.filter(x => x.status === 'Pago').reduce((sum, x) => sum + Number(x.amount || 0), 0);
-  const pending = rows.filter(x => ['Pendente', 'Parcial', 'Atrasado'].includes(x.status)).reduce((sum, x) => sum + Number(x.amount || 0), 0);
-  const actions = canCreate ? <div className="title-actions">
-    <button className="primary" onClick={() => setOpen('payment')}><Plus size={17}/>Novo recebimento</button>
-    <button className="table-action" onClick={() => setOpen('charge')}><Plus size={17}/>Nova cobrança</button>
-    {modules.plans && <button className="table-action" onClick={generateRecurring}><RefreshCw size={17}/>Gerar recorrências</button>}
-  </div> : undefined;
-
-  return <>
-    <Title title="Financeiro" sub="Recebimentos, contas a receber e pagamentos" action={actions}/>
-    <Notice message={message}/>
-    <div className="cards">
-      <article className="metric"><div><small>Receita recebida</small><strong>{money(received)}</strong></div></article>
-      <article className="metric"><div><small>Valores pendentes</small><strong>{money(pending)}</strong></div></article>
-      <article className="metric"><div><small>Pagamentos vencidos</small><strong>{rows.filter(x => x.status === 'Atrasado').length}</strong></div></article>
-    </div>
-    <div className="panel table-panel"><table><thead><tr><th>Origem</th><th>Referência</th><th>Valor</th><th>Forma</th><th>Vencimento</th><th>Status</th>{(canUpdate || canDelete) && <th/>}</tr></thead><tbody>
-      {rows.map(x => <tr key={x.key}><td>{x.origin}</td><td><b>{x.reference || '—'}</b></td><td>{money(Number(x.amount))}</td><td>{x.method || '—'}</td><td>{x.due_date || '—'}</td><td><span className="status">{x.status}</span></td>{(canUpdate || canDelete) && <td>{canUpdate && x.status !== 'Pago' && <button className="table-action" onClick={() => markPaid(x)}><CheckCircle2 size={15}/>Pagar</button>}{canDelete && x.recordKind === 'charge' && <button className="table-action" onClick={() => removeCharge(x)}><Trash2 size={15}/></button>}</td>}</tr>)}
-    </tbody></table>{!rows.length && <Empty text="Nenhum lançamento financeiro"/>}</div>
-    {open && canCreate && <Modal title={open === 'payment' ? 'Novo recebimento' : 'Nova cobrança'} onClose={() => setOpen(null)}>
-      <form className="form" onSubmit={save}>
-        {open === 'payment' ? <label>Ordem<select name="order_id" required>{orders.map(x => <option value={x.id} key={x.id}>{x.number} — {x.customer}</option>)}</select></label> : <label>Cliente/Aluno<input name="customer" required/></label>}
-        <label>Valor<input name="amount" type="number" step=".01" min="0" required/></label>
-        <div className="form-row">
-          {open === 'payment' && <label>Forma<select name="method">{meta?.payment_methods.map((x: string) => <option key={x}>{x}</option>)}</select></label>}
-          <label>Status<select name="status">{meta?.payment_statuses.map((x: string) => <option key={x}>{x}</option>)}</select></label>
-        </div>
-        <label>Vencimento<input name="due_date" type="date" required={open === 'charge'}/></label>
-        <button className="primary">Salvar</button>
-      </form>
-    </Modal>}
-  </>;
+function Reports({title}:{title:string[]}) {
+  const [period,setPeriod]=useState({period_from:'',period_to:''});const query=new URLSearchParams(Object.entries(period).filter(([,v])=>v)).toString();
+  const {data,error}=useData<any>(`/financial/reports?${query}`,[query]);const {allowed}=useModules();
+  if(!data)return error?<><Title title={title[0]} sub={title[1]}/><Notice message={error} error/></>:<Loading/>;
+  return <><Title title={title[0]} sub={title[1]} action={allowed('financial.export')?<button className="table-action" onClick={()=>download(`/reports/financial.csv?${query}`,'financeiro.csv')}><Download size={16}/>CSV</button>:undefined}/><Notice message={error} error/><Filters onClear={()=>setPeriod({period_from:'',period_to:''})}><input type="date" value={period.period_from} onChange={e=>setPeriod({...period,period_from:e.target.value})}/><input type="date" value={period.period_to} onChange={e=>setPeriod({...period,period_to:e.target.value})}/></Filters><div className="cards"><Metric label="Receita total" value={money(data.summary.received)} Icon={WalletCards} color="green"/><Metric label="Despesa total" value={money(data.summary.paid)} Icon={WalletCards} color="red"/><Metric label="Resultado" value={money(data.summary.result)} Icon={CheckCircle2} color={data.summary.result>=0?'green':'red'}/><Metric label="Margem" value={`${data.summary.margin}%`} Icon={Clock}/><Metric label="A receber" value={money(data.summary.open)} Icon={Clock}/><Metric label="A pagar" value={money(data.summary.payable_open)} Icon={Clock}/><Metric label="Inadimplência" value={`${data.summary.delinquency_rate}%`} Icon={AlertTriangle}/><Metric label="Recebimentos" value={data.summary.receipts} Icon={CheckCircle2}/><Metric label="Pagamentos" value={data.summary.payments} Icon={CheckCircle2}/></div><div className="dashboard-grid"><Bars title="Receita por mês" rows={data.by_month} moneyValues/><Bars title="Despesa por mês" rows={data.expense_by_month} moneyValues/><Bars title="Resultado por mês" rows={data.result_by_month} moneyValues/><Bars title="Receita por origem" rows={data.by_origin} moneyValues/><Bars title="Despesa por categoria" rows={data.expense_by_category} moneyValues/><Bars title="Formas de recebimento" rows={data.by_method} moneyValues/><Bars title="Formas de pagamento" rows={data.payment_by_method} moneyValues/></div><div className="panel table-panel"><table><thead><tr><th>Data</th><th>Cliente</th><th>Origem</th><th>Forma</th><th>Referência</th><th>Valor</th></tr></thead><tbody>{data.rows.map((x:any)=><tr key={x.id}><td>{fmt(x.received_on)}</td><td><b>{x.customer}</b></td><td>{x.origin}</td><td>{x.method}</td><td>{x.reference||'-'}</td><td>{money(x.amount)}</td></tr>)}</tbody></table>{!data.rows.length&&<Empty text="Sem recebimentos no período"/>}</div><div className="panel table-panel"><table><thead><tr><th>Data</th><th>Favorecido</th><th>Categoria</th><th>Forma</th><th>OS</th><th>Valor</th></tr></thead><tbody>{data.payment_rows.map((x:any)=><tr key={x.id}><td>{fmt(x.paid_on)}</td><td><b>{x.beneficiary}</b></td><td>{x.category}</td><td>{x.method}</td><td>{x.order_id||'-'}</td><td>{money(x.amount)}</td></tr>)}</tbody></table>{!data.payment_rows.length&&<Empty text="Sem pagamentos no período"/>}</div></>
 }

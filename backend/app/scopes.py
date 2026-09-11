@@ -6,8 +6,9 @@ or employee assignments never widen a user's access.
 from fastapi import HTTPException
 from sqlalchemy import and_, false, or_, select, true
 from .access import authorization, has_permission
-from .models import (Appointment, Customer, Department, Employee, ModuleRecord,
-                     Order, OrderTask, Payment, Plan, Service)
+from .models import (Appointment, Customer, Department, Employee, FinancialPayable,
+                     FinancialPayment, FinancialReceipt, ModuleRecord, Order,
+                     OrderTask, Payment, Plan, Service)
 
 
 def scope_clause(db, user, model):
@@ -30,6 +31,11 @@ def scope_clause(db, user, model):
             Order.assignee_id.in_(select(Employee.id).where(Employee.department_id.in_(departments)))))
     if model is Payment:
         return Payment.order_id.in_(select(Order.id).where(Order.deleted_at.is_(None), scope_clause(db, user, Order)))
+    if model is FinancialReceipt:
+        return FinancialReceipt.order_id.in_(select(Order.id).where(Order.deleted_at.is_(None), scope_clause(db, user, Order))) if own else or_(FinancialReceipt.department_id.in_(departments), FinancialReceipt.order_id.in_(select(Order.id).where(Order.deleted_at.is_(None), scope_clause(db, user, Order))))
+    if model in (FinancialPayable, FinancialPayment):
+        boundary = model.owner_user_id == user.id if own else model.department_id.in_(departments)
+        return or_(boundary, model.order_id.in_(select(Order.id).where(Order.deleted_at.is_(None), scope_clause(db, user, Order))))
     if model is Appointment:
         if own:
             return or_(Appointment.owner_user_id == user.id,

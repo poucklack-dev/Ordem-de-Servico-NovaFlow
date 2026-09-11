@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from .models import OrderStatus, Role
 
@@ -143,6 +144,78 @@ class PaymentIn(BaseModel):
     status: str = "Pendente"
     method: str = "PIX"
     due_date: date | None = None
+
+
+class ChargeIn(BaseModel):
+    department_id: int | None = None
+    customer: str = Field(min_length=2, max_length=150)
+    customer_id: int | None = None
+    description: str = Field(min_length=2, max_length=240)
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    due_date: date
+    origin: str = "Manual"
+    origin_id: int | None = None
+    reference: str | None = None
+    note: str | None = None
+
+    @field_validator("customer_id","origin_id","reference","note",mode="before")
+    @classmethod
+    def blank_to_none(cls,value): return None if value=="" else value
+
+
+class ReceiptIn(BaseModel):
+    department_id: int | None = None
+    charge_id: int | None = None
+    order_id: int | None = None
+    customer_id: int | None = None
+    customer: str | None = Field(default=None, min_length=2, max_length=150)
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    received_on: date
+    method: str = "PIX"
+    reference: str | None = None
+    note: str | None = None
+
+    @field_validator("department_id","charge_id","order_id","customer_id","reference","note",mode="before")
+    @classmethod
+    def blank_to_none(cls,value): return None if value=="" else value
+
+
+class ChargeContactIn(BaseModel):
+    happened_on: date
+    channel: str = "WhatsApp"
+    description: str = Field(min_length=1, max_length=2000)
+
+
+class PayableIn(BaseModel):
+    department_id: int | None = None
+    beneficiary: str = Field(min_length=2, max_length=150)
+    category: str = Field(min_length=2, max_length=80)
+    description: str = Field(min_length=2, max_length=240)
+    order_id: int | None = None
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    due_date: date
+    competence: date | None = None
+    note: str | None = None
+
+    @field_validator("department_id","order_id","competence","note",mode="before")
+    @classmethod
+    def blank_to_none(cls,value): return None if value=="" else value
+
+
+class OutgoingPaymentIn(BaseModel):
+    department_id: int | None = None
+    payable_id: int | None = None
+    order_id: int | None = None
+    beneficiary: str | None = Field(default=None, min_length=2, max_length=150)
+    category: str = "Operacional"
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    paid_on: date
+    method: str = "PIX"
+    note: str | None = None
+
+    @field_validator("department_id","payable_id","order_id","note",mode="before")
+    @classmethod
+    def blank_to_none(cls,value): return None if value=="" else value
 
 
 class UserIn(BaseModel):

@@ -20,6 +20,23 @@ def test_login_dashboard_and_demo_summary():
         assert summary.json()["has_demo_data"] is True
 
 
+def test_login_temporarily_locks_account_after_repeated_failures():
+    with TestClient(app) as client:
+        admin_login = client.post("/api/auth/login", json={"email": "admin@demo.com", "password": "Admin@123"})
+        admin = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+        viewer = next(x for x in client.get("/api/profiles", headers=admin).json() if x["name"] == "Visualizador")
+        email = f"lockout-{uuid.uuid4().hex}@example.com"
+        created = client.post("/api/users", headers=admin, json={"name": "Teste Lockout", "email": email, "password": "Teste@123", "profile_id": viewer["id"], "is_active": True})
+        assert created.status_code == 201, created.text
+
+        for _ in range(5):
+            denied = client.post("/api/auth/login", json={"email": email, "password": "senha-errada"})
+            assert denied.status_code == 401
+
+        locked = client.post("/api/auth/login", json={"email": email, "password": "Teste@123"})
+        assert locked.status_code == 429
+
+
 def test_demo_delete_requires_exact_confirmation():
     with TestClient(app) as client:
         response = client.post("/api/auth/login", json={"email": "admin@demo.com", "password": "Admin@123"})
@@ -262,3 +279,82 @@ def test_financial_write_permissions_are_independent():
         assert client.put(f"/api/module-data/financial/charges/{charge.json()['id']}",headers=headers,json={**payload,"status":"Pago"}).status_code==200
         assert client.delete(f"/api/module-data/financial/charges/{charge.json()['id']}",headers=headers).status_code==200
         client.put("/api/settings/modules",headers=admin,json=original)
+
+
+def test_financial_charge_receipts_and_delinquency_flow():
+    with TestClient(app) as client:
+        login=client.post("/api/auth/login",json={"email":"admin@demo.com","password":"Admin@123"});headers={"Authorization":f"Bearer {login.json()['access_token']}"}
+        original=client.get("/api/settings/modules",headers=headers).json()["modules"]
+        client.put("/api/settings/modules",headers=headers,json={"financial":True,"agenda":False,"plans":False,"academy":False,"school":False})
+        due=(date.today()-timedelta(days=3)).isoformat()
+        charge=client.post("/api/financial/charges",headers=headers,json={"customer":"Cliente Financeiro","description":"Mensalidade teste","amount":1000,"due_date":due,"origin":"Manual","reference":"FIN-001"})
+        assert charge.status_code==201,charge.text
+        charge_id=charge.json()["id"]
+        assert charge.json()["status"]=="Atrasado" and charge.json()["balance"]==1000
+        first=client.post(f"/api/financial/charges/{charge_id}/receipts",headers=headers,json={"customer":"Cliente Financeiro","amount":400,"received_on":date.today().isoformat(),"method":"PIX"})
+        assert first.status_code==201,first.text
+        partial=client.get(f"/api/financial/charges/{charge_id}",headers=headers).json()
+        assert partial["status"]=="Parcial" and partial["received"]==400 and partial["balance"]==600
+        delinquency=client.get("/api/financial/delinquency",headers=headers).json()
+        assert any(x["id"]==charge_id and x["balance"]==600 for x in delinquency["rows"])
+        second=client.post(f"/api/financial/charges/{charge_id}/receipts",headers=headers,json={"customer":"Cliente Financeiro","amount":600,"received_on":date.today().isoformat(),"method":"Transferência"})
+        assert second.status_code==201,second.text
+        paid=client.get(f"/api/financial/charges/{charge_id}",headers=headers).json()
+        assert paid["status"]=="Pago" and paid["balance"]==0
+        delinquency=client.get("/api/financial/delinquency",headers=headers).json()
+        assert all(x["id"]!=charge_id for x in delinquency["rows"])
+        receipts=client.get("/api/financial/receipts?q=FIN-001",headers=headers).json()
+        assert len([x for x in receipts if x["charge_id"]==charge_id])==2
+        client.put("/api/settings/modules",headers=headers,json={"financial":False,"agenda":False,"plans":False,"academy":False,"school":False})
+        assert client.get("/api/financial/charges",headers=headers).status_code==404
+        client.put("/api/settings/modules",headers=headers,json={"financial":True,"agenda":False,"plans":False,"academy":False,"school":False})
+        assert client.get(f"/api/financial/charges/{charge_id}",headers=headers).status_code==200
+        client.put("/api/settings/modules",headers=headers,json=original)
+
+
+def test_financial_payables_payments_and_cashflow():
+    with TestClient(app) as client:
+        login=client.post("/api/auth/login",json={"email":"admin@demo.com","password":"Admin@123"});headers={"Authorization":f"Bearer {login.json()['access_token']}"}
+        original=client.get("/api/settings/modules",headers=headers).json()["modules"]
+        client.put("/api/settings/modules",headers=headers,json={"financial":True,"agenda":False,"plans":False,"academy":False,"school":False})
+        due=(date.today()+timedelta(days=2)).isoformat()
+        payable=client.post("/api/financial/payables",headers=headers,json={"beneficiary":"Fornecedor Teste","category":"Material","description":"Peças para OS","amount":1000,"due_date":due})
+        assert payable.status_code==201,payable.text
+        payable_id=payable.json()["id"]
+        first=client.post(f"/api/financial/payables/{payable_id}/payments",headers=headers,json={"beneficiary":"Fornecedor Teste","category":"Material","amount":300,"paid_on":date.today().isoformat(),"method":"PIX"})
+        assert first.status_code==201,first.text
+        partial=client.get(f"/api/financial/payables/{payable_id}",headers=headers).json()
+        assert partial["status"]=="Parcial" and partial["paid"]==300 and partial["balance"]==700
+        second=client.post(f"/api/financial/payables/{payable_id}/payments",headers=headers,json={"beneficiary":"Fornecedor Teste","category":"Material","amount":700,"paid_on":date.today().isoformat(),"method":"Transferência"})
+        assert second.status_code==201,second.text
+        paid=client.get(f"/api/financial/payables/{payable_id}",headers=headers).json()
+        assert paid["status"]=="Pago" and paid["balance"]==0
+        overview=client.get("/api/financial/overview",headers=headers).json()
+        assert "paid_month" in overview["cards"] and "projected_result" in overview["cards"]
+        reports=client.get("/api/financial/reports",headers=headers).json()
+        assert reports["summary"]["payments"]>=2 and reports["summary"]["paid"]>=1000
+        client.put("/api/settings/modules",headers=headers,json=original)
+
+
+def test_password_change_and_financial_csv_respects_period_and_escapes_formulas():
+    with TestClient(app) as client:
+        admin_login=client.post("/api/auth/login",json={"email":"admin@demo.com","password":"Admin@123"});headers={"Authorization":f"Bearer {admin_login.json()['access_token']}"}
+        assert client.post("/api/auth/change-password",headers=headers,json={"current_password":"Admin@123","new_password":"Admin@1234"}).status_code==200
+        assert client.post("/api/auth/login",json={"email":"admin@demo.com","password":"Admin@123"}).status_code==401
+        new_login=client.post("/api/auth/login",json={"email":"admin@demo.com","password":"Admin@1234"})
+        assert new_login.status_code==200
+        headers={"Authorization":f"Bearer {new_login.json()['access_token']}"}
+        assert client.post("/api/auth/change-password",headers=headers,json={"current_password":"Admin@1234","new_password":"Admin@123"}).status_code==200
+
+        original=client.get("/api/settings/modules",headers=headers).json()["modules"]
+        client.put("/api/settings/modules",headers=headers,json={"financial":True,"agenda":False,"plans":False,"academy":False,"school":False})
+        old_day=(date.today()-timedelta(days=45)).isoformat()
+        current_day=date.today().isoformat()
+        assert client.post("/api/financial/receipts",headers=headers,json={"customer":"=Cliente Formula","amount":50,"received_on":old_day,"method":"PIX","reference":"OLD"}).status_code==201
+        assert client.post("/api/financial/receipts",headers=headers,json={"customer":"=Cliente Formula","amount":80,"received_on":current_day,"method":"PIX","reference":"NOW"}).status_code==201
+        csv_response=client.get(f"/api/reports/financial.csv?period_from={current_day}&period_to={current_day}",headers=headers)
+        assert csv_response.status_code==200
+        content=csv_response.content.decode("utf-8-sig")
+        assert "NOW" in content and "OLD" not in content
+        assert "'=Cliente Formula" in content
+        client.put("/api/settings/modules",headers=headers,json=original)
